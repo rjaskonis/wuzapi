@@ -1,5 +1,6 @@
 services:
   wuzapi-server:
+    container_name: wuzapi-app
     build:
       context: .
       dockerfile: Dockerfile
@@ -19,13 +20,13 @@ services:
       - WEBHOOK_FORMAT=${WEBHOOK_FORMAT:-json}
       - SESSION_DEVICE_NAME=${SESSION_DEVICE_NAME:-WuzAPI}
       # RabbitMQ configuration Optional
-      - RABBITMQ_URL=amqp://wuzapi:wuzapi@rabbitmq:5672/
-      - RABBITMQ_QUEUE=whatsapp_events
+      # - RABBITMQ_URL=amqp://wuzapi:wuzapi@rabbitmq:5672/
+      # - RABBITMQ_QUEUE=whatsapp_events
     depends_on:
       db:
         condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
+    #   rabbitmq:
+    #     condition: service_healthy
     networks:
       - wuzapi-network
     restart: on-failure
@@ -49,26 +50,27 @@ services:
       retries: 5
     restart: always
 
-  rabbitmq:
-    image: rabbitmq:3-management
-    hostname: rabbitmq
-    environment:
-      RABBITMQ_DEFAULT_USER: wuzapi
-      RABBITMQ_DEFAULT_PASS: wuzapi
-      RABBITMQ_DEFAULT_VHOST: /
-    ports:
-      - "5672:5672" # AMQP port
-      - "15672:15672" # Management UI port
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-    networks:
-      - wuzapi-network
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: always
+  # rabbitmq:
+  #   image: rabbitmq:3-management
+  #   container_name: wuzapi-rabbitmq
+  #   hostname: rabbitmq
+  #   environment:
+  #     RABBITMQ_DEFAULT_USER: wuzapi
+  #     RABBITMQ_DEFAULT_PASS: wuzapi
+  #     RABBITMQ_DEFAULT_VHOST: /
+  #   ports:
+  #     - "5672:5672" # AMQP port
+  #     - "15672:15672" # Management UI port
+  #   volumes:
+  #     - rabbitmq_data:/var/lib/rabbitmq
+  #   networks:
+  #     - wuzapi-network
+  #   healthcheck:
+  #     test: ["CMD", "rabbitmq-diagnostics", "ping"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #   restart: always
 
 networks:
   wuzapi-network:
@@ -76,4 +78,4 @@ networks:
 
 volumes:
   db_data:
-  rabbitmq_data:
+  # rabbitmq_data:

@@ -337,6 +337,35 @@ document.addEventListener('DOMContentLoaded', function() {
     loadHmacConfig();
   });
 
+  // Chatwoot Configuration
+  document.getElementById('chatwootConfig').addEventListener('click', function() {
+    $('#modalChatwootConfig').modal({
+      onApprove: function() {
+        saveChatwootConfig();
+        return false;
+      }
+    }).modal('show');
+    
+    // Add click handler for create inbox button
+    $('#createChatwootInbox').off('click').on('click', function() {
+      createChatwootInbox();
+    });
+    loadChatwootConfig();
+    
+    // Initialize Semantic UI checkboxes
+    $('#chatwootSignMsg').checkbox();
+    $('#chatwootMarkRead').checkbox();
+    
+    // Initialize checkbox change handler
+    $('#chatwootSignMsg').off('change').on('change', function() {
+      if ($(this).is(':checked')) {
+        $('#chatwootSignDelimiterField').show();
+      } else {
+        $('#chatwootSignDelimiterField').hide();
+      }
+    });
+  });
+
   // HMAC Generate Key
   document.getElementById('generateHmacKey').addEventListener('click', function() {
     generateRandomHmacKey();
@@ -1952,5 +1981,190 @@ function toggleHmacKeyVisibilityInstance() {
     input.attr('type', 'password');
     showBtn.show();
     hideBtn.hide();
+  }
+}
+
+// Chatwoot Configuration Functions
+async function loadChatwootConfig() {
+  const token = getLocalStorageItem('token');
+  const myHeaders = new Headers();
+  myHeaders.append('token', token);
+  
+  // Get cached API token from sessionStorage if available
+  const cachedApiToken = sessionStorage.getItem('chatwoot_api_token') || '';
+  
+  try {
+    const res = await fetch(baseUrl + "/session/chatwoot/config", {
+      method: "GET",
+      headers: myHeaders
+    });
+    
+    if (res.ok) {
+      const data = await res.json();
+      if (data.code === 200 && data.data) {
+        $('#chatwootBaseUrl').val(data.data.base_url || '');
+        $('#chatwootAccountId').val(data.data.account_id || '');
+        // If API token is masked, use cached value if available, otherwise keep current value
+        if (data.data.api_token === '***') {
+          // If we have a cached value, use it; otherwise keep what's already in the field
+          if (cachedApiToken) {
+            $('#chatwootApiToken').val(cachedApiToken);
+          } else {
+            // Don't clear if user has already entered something
+            const currentValue = $('#chatwootApiToken').val();
+            if (!currentValue) {
+              $('#chatwootApiToken').val('');
+            }
+          }
+        } else {
+          $('#chatwootApiToken').val(data.data.api_token || '');
+          // Cache the API token for future use
+          if (data.data.api_token) {
+            sessionStorage.setItem('chatwoot_api_token', data.data.api_token);
+          }
+        }
+        $('#chatwootInboxName').val(data.data.inbox_name || '');
+        // Load sign message settings
+        const signMsg = data.data.sign_msg || false;
+        $('#chatwootSignMsg').prop('checked', signMsg);
+        $('#chatwootSignDelimiter').val(data.data.sign_delimiter || '\\n');
+        // Show/hide delimiter field based on checkbox
+        if (signMsg) {
+          $('#chatwootSignDelimiterField').show();
+        } else {
+          $('#chatwootSignDelimiterField').hide();
+        }
+        // Load mark read setting
+        $('#chatwootMarkRead').prop('checked', data.data.mark_read || false);
+      } else {
+        // No config found, set defaults but preserve API token if cached
+        $('#chatwootBaseUrl').val('');
+        $('#chatwootAccountId').val('');
+        $('#chatwootApiToken').val(cachedApiToken || '');
+        $('#chatwootInboxName').val('');
+        $('#chatwootSignMsg').prop('checked', false);
+        $('#chatwootSignDelimiter').val('\\n');
+        $('#chatwootSignDelimiterField').hide();
+        $('#chatwootMarkRead').prop('checked', false);
+      }
+    }
+  } catch (error) {
+    console.error('Error loading Chatwoot config:', error);
+    // On error, preserve existing values
+    const currentApiToken = $('#chatwootApiToken').val() || cachedApiToken;
+    $('#chatwootBaseUrl').val($('#chatwootBaseUrl').val() || '');
+    $('#chatwootAccountId').val($('#chatwootAccountId').val() || '');
+    $('#chatwootApiToken').val(currentApiToken);
+    $('#chatwootInboxName').val($('#chatwootInboxName').val() || '');
+    
+    // Initialize checkbox behavior
+    $('#chatwootSignMsg').on('change', function() {
+      if ($(this).is(':checked')) {
+        $('#chatwootSignDelimiterField').show();
+      } else {
+        $('#chatwootSignDelimiterField').hide();
+      }
+    });
+  }
+}
+
+async function saveChatwootConfig() {
+  const token = getLocalStorageItem('token');
+  const myHeaders = new Headers();
+  myHeaders.append('token', token);
+  myHeaders.append('Content-Type', 'application/json');
+  
+  const apiTokenValue = $('#chatwootApiToken').val().trim();
+  
+  const config = {
+    base_url: $('#chatwootBaseUrl').val().trim(),
+    account_id: $('#chatwootAccountId').val().trim(),
+    api_token: apiTokenValue,
+    inbox_name: $('#chatwootInboxName').val().trim(),
+    sign_msg: $('#chatwootSignMsg').is(':checked'),
+    sign_delimiter: $('#chatwootSignDelimiter').val().trim() || '\\n',
+    mark_read: $('#chatwootMarkRead').is(':checked')
+  };
+  
+  // Cache the API token in sessionStorage so it persists when reopening
+  if (apiTokenValue) {
+    sessionStorage.setItem('chatwoot_api_token', apiTokenValue);
+  }
+  
+  try {
+    const res = await fetch(baseUrl + "/session/chatwoot/config", {
+      method: "POST",
+      headers: myHeaders,
+      body: JSON.stringify(config)
+    });
+    
+    const data = await res.json();
+    if (data.success) {
+      showSuccess('Chatwoot configuration saved successfully');
+      $('#modalChatwootConfig').modal('hide');
+    } else {
+      showError('Failed to save Chatwoot configuration: ' + (data.error || 'Unknown error'));
+    }
+  } catch (error) {
+    showError('Error saving Chatwoot configuration');
+    console.error('Error:', error);
+  }
+}
+
+async function createChatwootInbox() {
+  const token = getLocalStorageItem('token');
+  const myHeaders = new Headers();
+  myHeaders.append('token', token);
+  myHeaders.append('Content-Type', 'application/json');
+  
+  // First, save the Chatwoot configuration
+  const apiTokenValue = $('#chatwootApiToken').val().trim();
+  const config = {
+    base_url: $('#chatwootBaseUrl').val().trim(),
+    account_id: $('#chatwootAccountId').val().trim(),
+    api_token: apiTokenValue,
+    inbox_name: $('#chatwootInboxName').val().trim(),
+    sign_msg: $('#chatwootSignMsg').is(':checked'),
+    sign_delimiter: $('#chatwootSignDelimiter').val().trim() || '\\n',
+    mark_read: $('#chatwootMarkRead').is(':checked')
+  };
+  
+  // Cache the API token in sessionStorage so it persists when reopening
+  if (apiTokenValue) {
+    sessionStorage.setItem('chatwoot_api_token', apiTokenValue);
+  }
+  
+  try {
+    // Step 1: Save the configuration first
+    const saveRes = await fetch(baseUrl + "/session/chatwoot/config", {
+      method: "POST",
+      headers: myHeaders,
+      body: JSON.stringify(config)
+    });
+    
+    const saveData = await saveRes.json();
+    if (!saveData.success) {
+      showError('Failed to save Chatwoot configuration: ' + (saveData.error || 'Unknown error'));
+      return;
+    }
+    
+    // Step 2: Create the inbox after configuration is saved
+    const createHeaders = new Headers();
+    createHeaders.append('token', token);
+    
+    const res = await fetch(baseUrl + "/session/chatwoot/inbox/create", {
+      method: "POST",
+      headers: createHeaders
+    });
+    
+    const data = await res.json();
+    if (data.success) {
+      showSuccess(data.message || 'Chatwoot inbox created successfully. Inbox ID: ' + data.inbox_id);
+    } else {
+      showError('Failed to create Chatwoot inbox: ' + (data.error || 'Unknown error'));
+    }
+  } catch (error) {
+    showError('Error creating Chatwoot inbox: ' + error.message);
+    console.error('Error:', error);
   }
 }

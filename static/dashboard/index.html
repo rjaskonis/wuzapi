@@ -151,6 +151,12 @@
           <div class="description">Configure HMAC key for webhook security.</div>
         </div>
       </div>
+      <div class="purple card hidden widget" style="cursor: pointer;" id="chatwootConfig">
+        <div class="content"><a class="ui purple right ribbon label">Config</a>
+          <div class="header">Setup Chatwoot</div>
+          <div class="description">Configure Chatwoot integration settings.</div>
+        </div>
+      </div>
     </div>
 
     <div class="ui horizontal divider widget"> User </div>
@@ -557,6 +563,63 @@
       <div class="ui cancel button secondary">Cancel</div>
       <div class="ui red button" id="deleteHmacConfig">Delete Configuration</div>
       <div class="ui positive right labeled icon button" id="saveHmacConfig">Save<i class="checkmark icon"></i></div>
+    </div>
+  </div>
+
+  <!-- Chatwoot Configuration Modal -->
+  <div class="ui modal" id="modalChatwootConfig"><i class="close icon"></i>
+    <div class="header"> Chatwoot Configuration </div>
+    <div class="content">
+      <div class="ui info message">
+        <div class="header">Chatwoot Integration Settings</div>
+        <p>Configure Chatwoot integration settings. Enter your Chatwoot base URL, account ID, API token, and inbox name.</p>
+      </div>
+      <div class="ui form">
+        <div class="field">
+          <label>Base URL</label>
+          <input id="chatwootBaseUrl" type="text" placeholder="https://app.chatwoot.com">
+          <small>Your Chatwoot instance base URL.</small>
+        </div>
+        <div class="field">
+          <label>Account ID</label>
+          <input id="chatwootAccountId" type="text" placeholder="Enter account ID">
+          <small>Your Chatwoot account ID.</small>
+        </div>
+        <div class="field">
+          <label>API Token</label>
+          <input id="chatwootApiToken" type="text" placeholder="Enter API token">
+          <small>Your Chatwoot API token.</small>
+        </div>
+        <div class="field">
+          <label>Inbox Name</label>
+          <input id="chatwootInboxName" type="text" placeholder="Enter inbox name">
+          <small>Name of the Chatwoot inbox to use.</small>
+        </div>
+        <div class="field">
+          <div class="ui checkbox">
+            <input type="checkbox" id="chatwootSignMsg" tabindex="0">
+            <label>Sign messages with agent name</label>
+          </div>
+          <small>When enabled, messages sent from Chatwoot will be prefixed with the agent's name (e.g., "*Agent Name:*\nmessage").</small>
+        </div>
+        <div class="field" id="chatwootSignDelimiterField" style="display: none;">
+          <label>Message Delimiter</label>
+          <input id="chatwootSignDelimiter" type="text" placeholder="\n" value="\n">
+          <small>Delimiter between agent name and message (use \n for newline). Default: \n</small>
+        </div>
+        <div class="field">
+          <div class="ui checkbox">
+            <input type="checkbox" id="chatwootMarkRead" tabindex="0">
+            <label>Mark messages as read</label>
+          </div>
+          <small>When enabled, the last incoming message will be automatically marked as read after sending a message from Chatwoot to WhatsApp.</small>
+        </div>
+      </div>
+    </div>
+    <div class="actions">
+      <div class="ui cancel button secondary">Cancel</div>
+      <div class="ui positive right labeled icon button" id="saveChatwootConfig">Set<i class="checkmark icon"></i></div>
+      <div class="ui blue button" id="createChatwootInbox">Create Inbox</div>
     </div>
   </div>
 

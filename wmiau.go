@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	img "image"
+	"image/color"
+	"image/png"
 	"mime"
 	"net/http"
 	"net/url"
@@ -1300,6 +1304,211 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			} else {
 				log.Debug().Str("messageType", messageType).Str("messageID", evt.Info.ID).Msg("Skipping empty message from history")
 			}
+		}
+
+		// Send to Chatwoot if configured (only for incoming messages, not groups)
+		if !evt.Info.IsFromMe && !evt.Info.IsGroup {
+			go func() {
+				// Get Chatwoot config
+				config, err := mycli.s.getChatwootConfig(txtid)
+				if err == nil && config != nil && config.BaseURL != "" && config.AccountID != "" && config.APIToken != "" && config.InboxID != "" {
+					// Make sure postmap is available for media extraction
+					// postmap is populated earlier in the function for media messages
+					// Extract message data
+					phone := evt.Info.Sender.String()
+					if strings.HasSuffix(phone, "@s.whatsapp.net") {
+						phone = strings.TrimSuffix(phone, "@s.whatsapp.net")
+					}
+					
+					// Determine LID or JID
+					var lid, jid string
+					chatID := evt.Info.Chat.String()
+					if strings.HasSuffix(chatID, "@lid") {
+						lid = chatID
+						phone = ""
+					} else if strings.HasSuffix(chatID, "@s.whatsapp.net") {
+						jid = chatID
+						if phone == "" {
+							phone = strings.TrimSuffix(chatID, "@s.whatsapp.net")
+						}
+					}
+					
+					// Normalize phone to E164 format if we have a phone number
+					if phone != "" {
+						// Get default country from environment or use BR as default
+						defaultCountry := os.Getenv("DEFAULT_COUNTRY")
+						if defaultCountry == "" {
+							defaultCountry = "BR"
+						}
+						phone = normalizeToE164(phone, defaultCountry)
+					}
+					
+					// Extract text content
+					content := ""
+					if conv := evt.Message.GetConversation(); conv != "" {
+						content = conv
+					} else if ext := evt.Message.GetExtendedTextMessage(); ext != nil {
+						content = ext.GetText()
+					}
+					
+					// Extract media data
+					var image, audio, document, video map[string]interface{}
+					
+					// Handle reactions first - convert emoji to image
+					if reaction := evt.Message.GetReactionMessage(); reaction != nil {
+						reactionText := reaction.GetText()
+						if reactionText != "" {
+							// Create a simple image from the emoji reaction
+							// Create a 128x128 PNG with a light background and use emoji as caption
+							image = make(map[string]interface{})
+							
+							// Create a simple colored image (light gray background)
+							emojiImg := img.NewRGBA(img.Rect(0, 0, 128, 128))
+							// Fill with light gray background
+							bgColor := color.RGBA{240, 240, 240, 255}
+							for y := 0; y < 128; y++ {
+								for x := 0; x < 128; x++ {
+									emojiImg.Set(x, y, bgColor)
+								}
+							}
+							
+							// Encode as PNG
+							var buf bytes.Buffer
+							err := png.Encode(&buf, emojiImg)
+							if err == nil {
+								// Convert to base64
+								base64Str := base64.StdEncoding.EncodeToString(buf.Bytes())
+								image["base64"] = base64Str
+								image["mimeType"] = "image/png"
+								content = reactionText // Use emoji as caption
+							} else {
+								// Fallback: just send as text
+								content = reactionText
+								image = nil
+							}
+						}
+					} else if sticker := evt.Message.GetStickerMessage(); sticker != nil {
+						// Handle stickers - send as images (only if base64 is available)
+						// Note: postmap should have base64 from earlier processing
+						if base64, ok := postmap["base64"].(string); ok && base64 != "" {
+							image = make(map[string]interface{})
+							image["base64"] = base64
+							if mimeType, ok := postmap["mimeType"].(string); ok && mimeType != "" {
+								image["mimeType"] = mimeType
+							} else {
+								image["mimeType"] = "image/webp" // Default for stickers
+							}
+							// Stickers don't have captions, but we can add a label
+							if content == "" {
+								content = "Sticker"
+							}
+						} else {
+							// If no base64 available, skip sticker (don't send anything)
+							// This prevents errors from trying to send empty data
+							log.Debug().Str("messageID", evt.Info.ID).Msg("Sticker base64 not available, skipping Chatwoot send")
+							// Don't return - just skip this message type, continue with other processing
+						}
+					} else if img := evt.Message.GetImageMessage(); img != nil {
+						image = make(map[string]interface{})
+						if base64, ok := postmap["base64"].(string); ok {
+							image["base64"] = base64
+						}
+						if mimeType, ok := postmap["mimeType"].(string); ok {
+							image["mimeType"] = mimeType
+						}
+						if caption := img.GetCaption(); caption != "" {
+							image["caption"] = caption
+							if content == "" {
+								content = caption
+							}
+						}
+					}
+					
+					if aud := evt.Message.GetAudioMessage(); aud != nil {
+						audio = make(map[string]interface{})
+						if base64, ok := postmap["base64"].(string); ok {
+							audio["base64"] = base64
+						}
+						if mimeType, ok := postmap["mimeType"].(string); ok {
+							audio["mimeType"] = mimeType
+						}
+						audio["seconds"] = float64(aud.GetSeconds())
+					}
+					
+					if doc := evt.Message.GetDocumentMessage(); doc != nil {
+						document = make(map[string]interface{})
+						if base64, ok := postmap["base64"].(string); ok {
+							document["base64"] = base64
+						}
+						if mimeType, ok := postmap["mimeType"].(string); ok {
+							document["mimeType"] = mimeType
+						}
+						if fileName, ok := postmap["fileName"].(string); ok {
+							document["fileName"] = fileName
+						}
+						if caption := doc.GetCaption(); caption != "" {
+							document["caption"] = caption
+							if content == "" {
+								content = caption
+							}
+						}
+					}
+					
+					if vid := evt.Message.GetVideoMessage(); vid != nil {
+						video = make(map[string]interface{})
+						if base64, ok := postmap["base64"].(string); ok {
+							video["base64"] = base64
+						}
+						if mimeType, ok := postmap["mimeType"].(string); ok {
+							video["mimeType"] = mimeType
+						}
+						if caption := vid.GetCaption(); caption != "" {
+							video["caption"] = caption
+							if content == "" {
+								content = caption
+							}
+						}
+						video["seconds"] = float64(vid.GetSeconds())
+					}
+					
+					// Get sender photo (avatar) - would need to be fetched separately
+					senderPhoto := ""
+					
+					// Get contact name
+					contactName := evt.Info.PushName
+					
+					// Process reply ID if available
+					var replyID *int
+					if ext := evt.Message.GetExtendedTextMessage(); ext != nil {
+						if ctxInfo := ext.GetContextInfo(); ctxInfo != nil {
+							// TODO: Map WhatsApp message ID to Chatwoot message ID for replies
+							// For now, we'll skip reply handling
+						}
+					}
+					
+					// Send to Chatwoot
+					err = mycli.s.ProcessIncomingMessage(
+						txtid,
+						phone,
+						content,
+						senderPhoto,
+						contactName,
+						lid,
+						jid,
+						image,
+						audio,
+						document,
+						video,
+						evt.Info.ID,
+						replyID,
+					)
+					if err != nil {
+						log.Warn().Err(err).Str("messageID", evt.Info.ID).Msg("Failed to send message to Chatwoot")
+					} else {
+						log.Info().Str("messageID", evt.Info.ID).Msg("Message sent to Chatwoot successfully")
+					}
+				}
+			}()
 		}
 
 	case *events.Receipt:

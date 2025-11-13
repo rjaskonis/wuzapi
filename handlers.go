@@ -5962,6 +5962,704 @@ func (s *server) DeleteHmacConfig() http.HandlerFunc {
 	}
 }
 
+// Configure Chatwoot
+func (s *server) ConfigureChatwoot() http.HandlerFunc {
+	type chatwootConfigStruct struct {
+		BaseURL       string `json:"base_url"`
+		AccountID     string `json:"account_id"`
+		APIToken      string `json:"api_token"`
+		InboxName     string `json:"inbox_name"`
+		SignMsg       bool   `json:"sign_msg"`
+		SignDelimiter string `json:"sign_delimiter"`
+		MarkRead      bool   `json:"mark_read"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		txtid := r.Context().Value("userinfo").(Values).Get("Id")
+
+		decoder := json.NewDecoder(r.Body)
+		var t chatwootConfigStruct
+		err := decoder.Decode(&t)
+		if err != nil {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("could not decode payload"))
+			return
+		}
+
+		// Set default delimiter if empty
+		signDelimiter := t.SignDelimiter
+		if signDelimiter == "" {
+			signDelimiter = "\n"
+		}
+
+		// Update database
+		_, err = s.db.Exec(`
+			UPDATE users SET 
+				chatwoot_base_url = $1,
+				chatwoot_account_id = $2,
+				chatwoot_api_token = $3,
+				chatwoot_inbox_name = $4,
+				chatwoot_sign_msg = $5,
+				chatwoot_sign_delimiter = $6,
+				chatwoot_mark_read = $7
+			WHERE id = $8`,
+			t.BaseURL, t.AccountID, t.APIToken, t.InboxName, t.SignMsg, signDelimiter, t.MarkRead, txtid)
+
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("failed to save Chatwoot configuration"))
+			return
+		}
+
+		response := map[string]interface{}{
+			"success": true,
+			"Details": "Chatwoot configuration saved successfully",
+		}
+		s.respondWithJSON(w, http.StatusOK, response)
+	}
+}
+
+// Get Chatwoot Configuration
+func (s *server) GetChatwootConfig() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		txtid := r.Context().Value("userinfo").(Values).Get("Id")
+
+		var config struct {
+			BaseURL       string `json:"base_url" db:"base_url"`
+			AccountID     string `json:"account_id" db:"account_id"`
+			APIToken      string `json:"api_token" db:"api_token"`
+			InboxName     string `json:"inbox_name" db:"inbox_name"`
+			SignMsg       bool   `json:"sign_msg" db:"sign_msg"`
+			SignDelimiter string `json:"sign_delimiter" db:"sign_delimiter"`
+			MarkRead      bool   `json:"mark_read" db:"mark_read"`
+		}
+
+		err := s.db.Get(&config, `
+			SELECT 
+				chatwoot_base_url as base_url,
+				chatwoot_account_id as account_id,
+				chatwoot_api_token as api_token,
+				chatwoot_inbox_name as inbox_name,
+				COALESCE(chatwoot_sign_msg, false) as sign_msg,
+				COALESCE(chatwoot_sign_delimiter, '\n') as sign_delimiter,
+				COALESCE(chatwoot_mark_read, false) as mark_read
+			FROM users WHERE id = $1`, txtid)
+
+		if err != nil {
+			log.Error().Err(err).Str("userID", txtid).Msg("Failed to get Chatwoot configuration from database")
+			s.respondWithJSON(w, http.StatusInternalServerError, map[string]interface{}{
+				"code":    http.StatusInternalServerError,
+				"error":   "failed to get Chatwoot configuration",
+				"success": false,
+			})
+			return
+		}
+
+		log.Debug().Str("userID", txtid).Str("base_url", config.BaseURL).Str("account_id", config.AccountID).Str("inbox_name", config.InboxName).Msg("Retrieved Chatwoot configuration from database")
+
+		// Don't return API token for security
+		config.APIToken = "***" // Mask API token
+
+		response := map[string]interface{}{
+			"code":    200,
+			"success": true,
+			"data":    config,
+		}
+		s.respondWithJSON(w, http.StatusOK, response)
+	}
+}
+
+// CreateChatwootInbox creates a Chatwoot API inbox by calling Chatwoot's API
+func (s *server) CreateChatwootInbox() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		txtid := r.Context().Value("userinfo").(Values).Get("Id")
+		
+		config, err := s.getChatwootConfig(txtid)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, fmt.Errorf("failed to get Chatwoot configuration: %w", err))
+			return
+		}
+		
+		if config.BaseURL == "" || config.AccountID == "" || config.APIToken == "" {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("Chatwoot configuration incomplete. Please configure base URL, account ID, and API token first"))
+			return
+		}
+		
+		// Get webhook base URL from environment or construct from request
+		webhookBaseURL := os.Getenv("WUZAPI_WEBHOOK_BASE_URL")
+		if webhookBaseURL == "" {
+			// Construct from request
+			scheme := "http"
+			if r.TLS != nil {
+				scheme = "https"
+			}
+			host := r.Host
+			webhookBaseURL = fmt.Sprintf("%s://%s", scheme, host)
+		}
+		webhookBaseURL = strings.TrimSuffix(webhookBaseURL, "/")
+		
+		// Construct webhook URL for Chatwoot to call back
+		webhookURL := fmt.Sprintf("%s/webhook/chatwoot/%s", webhookBaseURL, txtid)
+		
+		// Determine inbox name
+		inboxName := config.InboxName
+		if inboxName == "" {
+			inboxName = "WuzAPI"
+		}
+		
+		// Create Chatwoot API client
+		client := getChatwootClient(config.BaseURL, config.APIToken)
+		
+		// Try to find existing inbox by name first
+		existingInbox, err := findInboxByName(client, config.AccountID, inboxName)
+		if err == nil && existingInbox != nil {
+			// Inbox exists, update stored ID
+			err = s.updateChatwootInboxID(txtid, fmt.Sprintf("%d", existingInbox.ID))
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to update inbox ID")
+			}
+			s.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+				"success": true,
+				"message": "Inbox already exists",
+				"inbox_id": existingInbox.ID,
+				"inbox_name": existingInbox.Name,
+			})
+			return
+		}
+		
+		// Create new inbox via Chatwoot API
+		allowReopen := true // Allow messages after resolved
+		inbox, err := createAPIInbox(client, config.AccountID, inboxName, webhookURL, allowReopen)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, fmt.Errorf("failed to create Chatwoot inbox: %w", err))
+			return
+		}
+		
+		// Store the inbox ID returned by Chatwoot
+		err = s.updateChatwootInboxID(txtid, fmt.Sprintf("%d", inbox.ID))
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to store inbox ID")
+		}
+		
+		s.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Inbox created successfully",
+			"inbox_id": inbox.ID,
+			"inbox_name": inbox.Name,
+			"webhook_url": webhookURL,
+		})
+	}
+}
+
+// ChatwootWebhookCallback handles incoming messages from Chatwoot
+func (s *server) ChatwootWebhookCallback() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		vars := mux.Vars(r)
+		userID := vars["userID"]
+		
+		if userID == "" {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("user ID is required"))
+			return
+		}
+		
+		// Parse webhook payload
+		var payload map[string]interface{}
+		decoder := json.NewDecoder(r.Body)
+		err := decoder.Decode(&payload)
+		if err != nil {
+			s.Respond(w, r, http.StatusBadRequest, fmt.Errorf("failed to decode payload: %w", err))
+			return
+		}
+		
+		// Check if it's a message_created event
+		event, _ := payload["event"].(string)
+		if event != "message_created" {
+			s.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+				"success": true,
+				"message": "Event ignored",
+			})
+			return
+		}
+		
+		// Check if it's an outgoing message (from agent)
+		messageType, _ := payload["message_type"].(string)
+		if messageType != "outgoing" {
+			s.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+				"success": true,
+				"message": "Not an outgoing message",
+			})
+			return
+		}
+		
+		// Check if it's a private message
+		private, _ := payload["private"].(bool)
+		if private {
+			s.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+				"success": true,
+				"message": "Private message ignored",
+			})
+			return
+		}
+		
+		// Extract conversation data
+		conversationData, ok := payload["conversation"].(map[string]interface{})
+		if !ok {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("conversation data not found"))
+			return
+		}
+		
+		// Extract contact data with proper null checks
+		meta, _ := conversationData["meta"].(map[string]interface{})
+		if meta == nil {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("conversation meta not found"))
+			return
+		}
+		
+		sender, _ := meta["sender"].(map[string]interface{})
+		if sender == nil {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("sender not found in conversation meta"))
+			return
+		}
+		
+		identifier, _ := sender["identifier"].(string)
+		if identifier == "" {
+			// Try phone_number as fallback
+			if phoneNumber, ok := sender["phone_number"].(string); ok && phoneNumber != "" {
+				// Remove + prefix if present
+				identifier = strings.TrimPrefix(phoneNumber, "+")
+			}
+		}
+		
+		if identifier == "" {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("contact identifier not found"))
+			return
+		}
+		
+		// Determine phone, LID, or JID
+		var phone, lid, jid string
+		if strings.HasSuffix(identifier, "@lid") {
+			lid = identifier
+		} else if strings.HasSuffix(identifier, "@s.whatsapp.net") {
+			jid = identifier
+			phone = strings.TrimSuffix(identifier, "@s.whatsapp.net")
+		} else {
+			phone = identifier
+		}
+		
+		recipient := phone
+		if recipient == "" {
+			recipient = lid
+		}
+		if recipient == "" {
+			recipient = jid
+		}
+		
+		if recipient == "" {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("no valid recipient identifier"))
+			return
+		}
+		
+		// Extract message content first (before any config operations)
+		content, _ := payload["content"].(string)
+		
+		// Get Chatwoot configuration to check sign settings
+		// Use default config if retrieval fails to ensure messages can still be sent
+		var config *ChatwootConfig
+		config, err = s.getChatwootConfig(userID)
+		if err != nil {
+			log.Warn().Err(err).Str("userID", userID).Msg("Failed to get Chatwoot config, proceeding with defaults")
+			config = &ChatwootConfig{
+				SignMsg:       false,
+				SignDelimiter: "\n",
+				MarkRead:      false,
+			}
+		}
+		
+		// Ensure config is never nil
+		if config == nil {
+			config = &ChatwootConfig{
+				SignMsg:       false,
+				SignDelimiter: "\n",
+				MarkRead:      false,
+			}
+		}
+
+		// Extract sender name for message signing
+		var senderName string
+		if config.SignMsg {
+			// Try to get sender name from conversation.messages[0].sender
+			if messages, ok := conversationData["messages"].([]interface{}); ok && len(messages) > 0 {
+				if firstMsg, ok := messages[0].(map[string]interface{}); ok {
+					if sender, ok := firstMsg["sender"].(map[string]interface{}); ok {
+						if name, ok := sender["available_name"].(string); ok && name != "" {
+							senderName = name
+						} else if name, ok := sender["name"].(string); ok && name != "" {
+							senderName = name
+						}
+					}
+				}
+			}
+			// Fallback: try payload.sender
+			if senderName == "" {
+				if sender, ok := payload["sender"].(map[string]interface{}); ok {
+					if name, ok := sender["available_name"].(string); ok && name != "" {
+						senderName = name
+					} else if name, ok := sender["name"].(string); ok && name != "" {
+						senderName = name
+					}
+				}
+			}
+
+			// Apply message signing if sender name is available
+			if senderName != "" && content != "" {
+				delimiter := config.SignDelimiter
+				if delimiter == "" {
+					delimiter = "\n"
+				}
+				// Replace \n escape sequences with actual newlines
+				delimiter = strings.ReplaceAll(delimiter, "\\n", "\n")
+				content = fmt.Sprintf("*%s:*%s%s", senderName, delimiter, content)
+			}
+		}
+		
+		// Extract attachments - check both payload and conversation.messages
+		var attachments []interface{}
+		if atts, ok := payload["attachments"].([]interface{}); ok {
+			attachments = atts
+		} else if messages, ok := conversationData["messages"].([]interface{}); ok && len(messages) > 0 {
+			// Check first message for attachments
+			if firstMsg, ok := messages[0].(map[string]interface{}); ok {
+				if atts, ok := firstMsg["attachments"].([]interface{}); ok {
+					attachments = atts
+				}
+			}
+		}
+		
+		// Only proceed if we have content or attachments
+		if content == "" && len(attachments) == 0 {
+			log.Warn().Str("userID", userID).Msg("No content or attachments to send")
+			s.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+				"success": true,
+				"message": "No content or attachments to send",
+			})
+			return
+		}
+		
+		// Extract reply information
+		var replyToID *int
+		if contentAttributes, ok := payload["content_attributes"].(map[string]interface{}); ok && contentAttributes != nil {
+			if inReplyTo, ok := contentAttributes["in_reply_to"].(float64); ok {
+				replyID := int(inReplyTo)
+				replyToID = &replyID
+			}
+		}
+		
+		// Get WhatsApp client
+		client := clientManager.GetWhatsmeowClient(userID)
+		if client == nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("WhatsApp session not connected"))
+			return
+		}
+		
+		// Get recipient JID once
+		recipientJID, err := validateMessageFields(recipient, nil, nil)
+		if err != nil {
+			log.Error().Err(err).Str("recipient", recipient).Msg("Invalid recipient")
+			s.Respond(w, r, http.StatusBadRequest, fmt.Errorf("invalid recipient: %w", err))
+			return
+		}
+		
+		// Handle attachments if present
+		if len(attachments) > 0 {
+			log.Info().Int("attachment_count", len(attachments)).Msg("Processing attachments from Chatwoot")
+			
+			// Process each attachment
+			for i, attachment := range attachments {
+				att, ok := attachment.(map[string]interface{})
+				if !ok {
+					log.Warn().Int("index", i).Msg("Invalid attachment format, skipping")
+					continue
+				}
+				
+				// Get attachment URL and type
+				dataURL, _ := att["data_url"].(string)
+				if dataURL == "" {
+					log.Warn().Int("index", i).Msg("Attachment missing data_url, skipping")
+					continue
+				}
+				
+				fileType, _ := att["file_type"].(string)
+				fileName, _ := att["file_name"].(string)
+				if fileName == "" {
+					fileName, _ = att["extension"].(string)
+				}
+				
+				// Download attachment from Chatwoot
+				attachmentData, contentType, err := fetchURLBytes(r.Context(), dataURL, 100*1024*1024) // 100MB limit
+				if err != nil {
+					log.Error().Err(err).Str("url", dataURL).Msg("Failed to download attachment")
+					continue
+				}
+				
+				// Determine media type from file_type or content-type
+				mediaType := whatsmeow.MediaDocument
+				if fileType == "image" {
+					mediaType = whatsmeow.MediaImage
+				} else if fileType == "audio" {
+					mediaType = whatsmeow.MediaAudio
+				} else if fileType == "video" {
+					mediaType = whatsmeow.MediaVideo
+				} else {
+					// Try to detect from content-type
+					if strings.HasPrefix(contentType, "image/") {
+						mediaType = whatsmeow.MediaImage
+					} else if strings.HasPrefix(contentType, "audio/") {
+						mediaType = whatsmeow.MediaAudio
+					} else if strings.HasPrefix(contentType, "video/") {
+						mediaType = whatsmeow.MediaVideo
+					}
+				}
+				
+				// Upload to WhatsApp
+				uploaded, err := client.Upload(context.Background(), attachmentData, mediaType)
+				if err != nil {
+					log.Error().Err(err).Str("file_type", fileType).Msg("Failed to upload attachment")
+					continue
+				}
+				
+				msgid := client.GenerateMessageID()
+				var msg *waE2E.Message
+				
+				// Create appropriate message type
+				switch mediaType {
+				case whatsmeow.MediaImage:
+					// Create thumbnail for image
+					reader := bytes.NewReader(attachmentData)
+					img, _, err := image.Decode(reader)
+					var thumbnailBytes []byte
+					if err == nil {
+						m := resize.Thumbnail(72, 72, img, resize.Lanczos3)
+						var thumbBuf bytes.Buffer
+						jpeg.Encode(&thumbBuf, m, nil)
+						thumbnailBytes = thumbBuf.Bytes()
+					}
+					
+					msg = &waE2E.Message{
+						ImageMessage: &waE2E.ImageMessage{
+							URL:           proto.String(uploaded.URL),
+							DirectPath:    proto.String(uploaded.DirectPath),
+							MediaKey:      uploaded.MediaKey,
+							Mimetype:      proto.String(contentType),
+							FileEncSHA256: uploaded.FileEncSHA256,
+							FileSHA256:    uploaded.FileSHA256,
+							FileLength:    proto.Uint64(uint64(len(attachmentData))),
+							Caption:       proto.String(content),
+							JPEGThumbnail: thumbnailBytes,
+						},
+					}
+					content = "" // Clear content after first attachment
+					
+				case whatsmeow.MediaAudio:
+					msg = &waE2E.Message{
+						AudioMessage: &waE2E.AudioMessage{
+							URL:           proto.String(uploaded.URL),
+							DirectPath:    proto.String(uploaded.DirectPath),
+							MediaKey:      uploaded.MediaKey,
+							Mimetype:      proto.String(contentType),
+							FileEncSHA256: uploaded.FileEncSHA256,
+							FileSHA256:    uploaded.FileSHA256,
+							FileLength:    proto.Uint64(uint64(len(attachmentData))),
+							PTT:           proto.Bool(false), // Not a voice note
+						},
+					}
+					content = "" // Clear content after first attachment
+					
+				case whatsmeow.MediaVideo:
+					// Create thumbnail for video if available
+					var thumbnailBytes []byte
+					if thumbURL, ok := att["thumb_url"].(string); ok && thumbURL != "" {
+						thumbData, _, err := fetchURLBytes(r.Context(), thumbURL, 10*1024*1024) // 10MB limit for thumbnails
+						if err == nil {
+							thumbnailBytes = thumbData
+						}
+					}
+					
+					msg = &waE2E.Message{
+						VideoMessage: &waE2E.VideoMessage{
+							URL:           proto.String(uploaded.URL),
+							DirectPath:    proto.String(uploaded.DirectPath),
+							MediaKey:      uploaded.MediaKey,
+							Mimetype:      proto.String(contentType),
+							FileEncSHA256: uploaded.FileEncSHA256,
+							FileSHA256:    uploaded.FileSHA256,
+							FileLength:    proto.Uint64(uint64(len(attachmentData))),
+							Caption:       proto.String(content),
+							JPEGThumbnail: thumbnailBytes,
+						},
+					}
+					content = "" // Clear content after first attachment
+					
+				default: // Document
+					if fileName == "" {
+						fileName = "document"
+					}
+					msg = &waE2E.Message{
+						DocumentMessage: &waE2E.DocumentMessage{
+							URL:           proto.String(uploaded.URL),
+							DirectPath:    proto.String(uploaded.DirectPath),
+							MediaKey:      uploaded.MediaKey,
+							Mimetype:      proto.String(contentType),
+							FileEncSHA256: uploaded.FileEncSHA256,
+							FileSHA256:    uploaded.FileSHA256,
+							FileLength:    proto.Uint64(uint64(len(attachmentData))),
+							FileName:      proto.String(fileName),
+							Caption:       proto.String(content),
+						},
+					}
+					content = "" // Clear content after first attachment
+				}
+				
+				// Send message
+				_, err = client.SendMessage(context.Background(), recipientJID, msg, whatsmeow.SendRequestExtra{ID: msgid})
+				if err != nil {
+					log.Error().Err(err).Str("file_type", fileType).Str("url", dataURL).Msg("Failed to send attachment")
+					continue
+				}
+				
+				log.Info().Str("file_type", fileType).Str("url", dataURL).Msg("Attachment sent successfully")
+			}
+			
+			// If we still have content after processing attachments, send it as text
+			if content != "" {
+				msgid := client.GenerateMessageID()
+				msg := &waE2E.Message{
+					Conversation: proto.String(content),
+				}
+				_, err = client.SendMessage(context.Background(), recipientJID, msg, whatsmeow.SendRequestExtra{ID: msgid})
+				if err != nil {
+					log.Error().Err(err).Str("content", content).Msg("Failed to send text content")
+				}
+			}
+			
+			// Mark last incoming message as read if enabled
+			if config.MarkRead {
+				go func() {
+					// Small delay to ensure message history is up to date
+					time.Sleep(500 * time.Millisecond)
+					
+					var lastMessage HistoryMessage
+					query := `
+						SELECT message_id, sender_jid, chat_jid
+						FROM message_history
+						WHERE user_id = $1 AND chat_jid = $2 AND sender_jid != $3
+						ORDER BY timestamp DESC
+						LIMIT 1`
+					
+					if s.db.DriverName() == "sqlite" {
+						query = strings.ReplaceAll(query, "$1", "?")
+						query = strings.ReplaceAll(query, "$2", "?")
+						query = strings.ReplaceAll(query, "$3", "?")
+						err = s.db.Get(&lastMessage, query, userID, recipientJID.String(), "me")
+					} else {
+						err = s.db.Get(&lastMessage, query, userID, recipientJID.String(), "me")
+					}
+					
+					if err == nil && lastMessage.MessageID != "" {
+						log.Info().Str("message_id", lastMessage.MessageID).Str("chat", recipientJID.String()).Str("sender", lastMessage.SenderJID).Msg("Found incoming message to mark as read")
+						err = client.MarkRead(context.Background(), []string{lastMessage.MessageID}, time.Now(), recipientJID, types.EmptyJID)
+						if err != nil {
+							log.Warn().Err(err).Str("message_id", lastMessage.MessageID).Str("chat", recipientJID.String()).Msg("Failed to mark message as read")
+						} else {
+							log.Info().Str("message_id", lastMessage.MessageID).Str("chat", recipientJID.String()).Str("sender", lastMessage.SenderJID).Msg("Successfully marked last incoming message as read")
+						}
+					} else {
+						if err != nil && err != sql.ErrNoRows {
+							log.Warn().Err(err).Str("chat", recipientJID.String()).Msg("Error querying for incoming messages to mark as read")
+						} else {
+							log.Debug().Str("chat", recipientJID.String()).Msg("No incoming messages found in history to mark as read")
+						}
+					}
+				}()
+			}
+			
+			s.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+				"success": true,
+				"message": "Attachments sent to WhatsApp",
+			})
+			return
+		}
+		
+		// Send text message (we already checked that content is not empty at the top)
+		msgid := client.GenerateMessageID()
+		
+		if replyToID != nil {
+			// TODO: Map Chatwoot message ID to WhatsApp message ID for replies
+			// For now, we'll skip the reply context
+			log.Info().Int("reply_to", *replyToID).Msg("Reply detected but not yet implemented")
+		}
+		
+		msg := &waE2E.Message{
+			Conversation: proto.String(content),
+		}
+		
+		_, err = client.SendMessage(context.Background(), recipientJID, msg, whatsmeow.SendRequestExtra{ID: msgid})
+		if err != nil {
+			log.Error().Err(err).Str("recipient", recipient).Str("content", content).Msg("Failed to send message to WhatsApp")
+			s.Respond(w, r, http.StatusInternalServerError, fmt.Errorf("failed to send message: %w", err))
+			return
+		}
+		
+		log.Info().Str("recipient", recipient).Str("content", content).Msg("Message sent to WhatsApp successfully")
+		
+		// Mark last incoming message as read if enabled
+		if config.MarkRead {
+			go func() {
+				// Small delay to ensure message history is up to date
+				time.Sleep(500 * time.Millisecond)
+				
+				// Query for the last incoming message from this chat
+				// Incoming messages have sender_jid != "me" (outgoing messages use "me" as sender_jid)
+				var lastMessage HistoryMessage
+				query := `
+					SELECT message_id, sender_jid, chat_jid
+					FROM message_history
+					WHERE user_id = $1 AND chat_jid = $2 AND sender_jid != $3
+					ORDER BY timestamp DESC
+					LIMIT 1`
+				
+				if s.db.DriverName() == "sqlite" {
+					query = strings.ReplaceAll(query, "$1", "?")
+					query = strings.ReplaceAll(query, "$2", "?")
+					query = strings.ReplaceAll(query, "$3", "?")
+					err = s.db.Get(&lastMessage, query, userID, recipientJID.String(), "me")
+				} else {
+					err = s.db.Get(&lastMessage, query, userID, recipientJID.String(), "me")
+				}
+				
+				if err == nil && lastMessage.MessageID != "" {
+					log.Info().Str("message_id", lastMessage.MessageID).Str("chat", recipientJID.String()).Str("sender", lastMessage.SenderJID).Msg("Found incoming message to mark as read")
+					// Mark the message as read
+					err = client.MarkRead(context.Background(), []string{lastMessage.MessageID}, time.Now(), recipientJID, types.EmptyJID)
+					if err != nil {
+						log.Warn().Err(err).Str("message_id", lastMessage.MessageID).Str("chat", recipientJID.String()).Msg("Failed to mark message as read")
+					} else {
+						log.Info().Str("message_id", lastMessage.MessageID).Str("chat", recipientJID.String()).Str("sender", lastMessage.SenderJID).Msg("Successfully marked last incoming message as read")
+					}
+				} else {
+					if err != nil && err != sql.ErrNoRows {
+						log.Warn().Err(err).Str("chat", recipientJID.String()).Msg("Error querying for incoming messages to mark as read")
+					} else {
+						log.Debug().Str("chat", recipientJID.String()).Msg("No incoming messages found in history to mark as read")
+					}
+				}
+			}()
+		}
+		
+		s.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Message sent to WhatsApp",
+		})
+	}
+}
+
 // RejectCall rejects an incoming call
 func (s *server) RejectCall() http.HandlerFunc {
 

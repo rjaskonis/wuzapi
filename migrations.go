@@ -70,6 +70,26 @@ var migrations = []Migration{
 		Name:  "add_data_json",
 		UpSQL: addDataJsonSQL,
 	},
+	{
+		ID:    9,
+		Name:  "add_chatwoot_support",
+		UpSQL: addChatwootSupportSQL,
+	},
+	{
+		ID:    10,
+		Name:  "add_chatwoot_inbox_id",
+		UpSQL: addChatwootInboxIDSQL,
+	},
+	{
+		ID:    11,
+		Name:  "add_chatwoot_sign_message",
+		UpSQL: addChatwootSignMessageSQL,
+	},
+	{
+		ID:    12,
+		Name:  "add_chatwoot_mark_read",
+		UpSQL: addChatwootMarkReadSQL,
+	},
 }
 
 const changeIDToStringSQL = `
@@ -435,6 +455,46 @@ func applyMigration(db *sqlx.DB, migration Migration) error {
 		} else {
 			_, err = tx.Exec(migration.UpSQL)
 		}
+	} else if migration.ID == 9 {
+		if db.DriverName() == "sqlite" {
+			// Handle Chatwoot columns for SQLite
+			err = addColumnIfNotExistsSQLite(tx, "users", "chatwoot_base_url", "TEXT DEFAULT ''")
+			if err == nil {
+				err = addColumnIfNotExistsSQLite(tx, "users", "chatwoot_account_id", "TEXT DEFAULT ''")
+			}
+			if err == nil {
+				err = addColumnIfNotExistsSQLite(tx, "users", "chatwoot_api_token", "TEXT DEFAULT ''")
+			}
+			if err == nil {
+				err = addColumnIfNotExistsSQLite(tx, "users", "chatwoot_inbox_name", "TEXT DEFAULT ''")
+			}
+		} else {
+			_, err = tx.Exec(migration.UpSQL)
+		}
+	} else if migration.ID == 10 {
+		if db.DriverName() == "sqlite" {
+			// Handle Chatwoot inbox_id column for SQLite
+			err = addColumnIfNotExistsSQLite(tx, "users", "chatwoot_inbox_id", "TEXT DEFAULT ''")
+		} else {
+			_, err = tx.Exec(migration.UpSQL)
+		}
+	} else if migration.ID == 11 {
+		if db.DriverName() == "sqlite" {
+			// Handle Chatwoot sign message columns for SQLite
+			err = addColumnIfNotExistsSQLite(tx, "users", "chatwoot_sign_msg", "BOOLEAN DEFAULT 0")
+			if err == nil {
+				err = addColumnIfNotExistsSQLite(tx, "users", "chatwoot_sign_delimiter", "TEXT DEFAULT '\n'")
+			}
+		} else {
+			_, err = tx.Exec(migration.UpSQL)
+		}
+	} else if migration.ID == 12 {
+		if db.DriverName() == "sqlite" {
+			// Handle Chatwoot mark read column for SQLite
+			err = addColumnIfNotExistsSQLite(tx, "users", "chatwoot_mark_read", "BOOLEAN DEFAULT 0")
+		} else {
+			_, err = tx.Exec(migration.UpSQL)
+		}
 	} else {
 		_, err = tx.Exec(migration.UpSQL)
 	}
@@ -641,6 +701,75 @@ BEGIN
     -- Add hmac_key column as BYTEA for encrypted data
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'hmac_key') THEN
         ALTER TABLE users ADD COLUMN hmac_key BYTEA;
+    END IF;
+END $$;
+
+-- SQLite version (handled in code)
+`
+
+const addChatwootSupportSQL = `
+-- PostgreSQL version - Add Chatwoot configuration columns
+DO $$
+BEGIN
+    -- Add Chatwoot configuration columns if they don't exist
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'chatwoot_base_url') THEN
+        ALTER TABLE users ADD COLUMN chatwoot_base_url TEXT DEFAULT '';
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'chatwoot_account_id') THEN
+        ALTER TABLE users ADD COLUMN chatwoot_account_id TEXT DEFAULT '';
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'chatwoot_api_token') THEN
+        ALTER TABLE users ADD COLUMN chatwoot_api_token TEXT DEFAULT '';
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'chatwoot_inbox_name') THEN
+        ALTER TABLE users ADD COLUMN chatwoot_inbox_name TEXT DEFAULT '';
+    END IF;
+END $$;
+
+-- SQLite version (handled in code)
+`
+
+const addChatwootInboxIDSQL = `
+-- PostgreSQL version - Add Chatwoot inbox_id column
+DO $$
+BEGIN
+    -- Add Chatwoot inbox_id column if it doesn't exist
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'chatwoot_inbox_id') THEN
+        ALTER TABLE users ADD COLUMN chatwoot_inbox_id TEXT DEFAULT '';
+    END IF;
+END $$;
+
+-- SQLite version (handled in code)
+`
+
+const addChatwootSignMessageSQL = `
+-- PostgreSQL version - Add Chatwoot sign message columns
+DO $$
+BEGIN
+    -- Add chatwoot_sign_msg column if it doesn't exist
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'chatwoot_sign_msg') THEN
+        ALTER TABLE users ADD COLUMN chatwoot_sign_msg BOOLEAN DEFAULT false;
+    END IF;
+    
+    -- Add chatwoot_sign_delimiter column if it doesn't exist
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'chatwoot_sign_delimiter') THEN
+        ALTER TABLE users ADD COLUMN chatwoot_sign_delimiter TEXT DEFAULT '\n';
+    END IF;
+END $$;
+
+-- SQLite version (handled in code)
+`
+
+const addChatwootMarkReadSQL = `
+-- PostgreSQL version - Add Chatwoot mark read column
+DO $$
+BEGIN
+    -- Add chatwoot_mark_read column if it doesn't exist
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'chatwoot_mark_read') THEN
+        ALTER TABLE users ADD COLUMN chatwoot_mark_read BOOLEAN DEFAULT false;
     END IF;
 END $$;
 
