@@ -20,6 +20,7 @@ type DatabaseConfig struct {
 	Name     string
 	Path     string
 	SSLMode  string
+	Schema   string
 }
 
 func InitializeDatabase(exPath string) (*sqlx.DB, error) {
@@ -38,6 +39,7 @@ func getDatabaseConfig(exPath string) DatabaseConfig {
 	dbHost := os.Getenv("DB_HOST")
 	dbPort := os.Getenv("DB_PORT")
 	dbSSL := os.Getenv("DB_SSLMODE")
+	dbSchema := os.Getenv("DB_SCHEMA")
 
 	sslMode := dbSSL
 	if dbSSL == "true" {
@@ -55,6 +57,7 @@ func getDatabaseConfig(exPath string) DatabaseConfig {
 			Password: dbPassword,
 			Name:     dbName,
 			SSLMode:  sslMode,
+			Schema:   dbSchema,
 		}
 	}
 
@@ -70,6 +73,7 @@ func initializePostgres(config DatabaseConfig) (*sqlx.DB, error) {
 		config.User, config.Password, config.Name, config.Host, config.Port, config.SSLMode,
 	)
 
+	// Open connection without search_path first to ensure schema exists
 	db, err := sqlx.Open("postgres", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open postgres connection: %w", err)
@@ -77,6 +81,29 @@ func initializePostgres(config DatabaseConfig) (*sqlx.DB, error) {
 
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("failed to ping postgres database: %w", err)
+	}
+
+	// Create schema if specified and doesn't exist
+	if config.Schema != "" {
+		// Use PostgreSQL's quote_ident function to safely quote the schema identifier
+		// Cast to text explicitly to help PostgreSQL determine the parameter type
+		var quotedSchema string
+		err = db.Get(&quotedSchema, `SELECT quote_ident($1::text)`, config.Schema)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to quote schema name: %w", err)
+		}
+		_, err = db.Exec(`CREATE SCHEMA IF NOT EXISTS ` + quotedSchema)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to create schema %s: %w", config.Schema, err)
+		}
+		// Set search_path for this connection
+		_, err = db.Exec(`SET search_path TO ` + quotedSchema)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to set search_path to %s: %w", config.Schema, err)
+		}
 	}
 
 	return db, nil

@@ -5822,6 +5822,259 @@ func (s *server) GetHistory() http.HandlerFunc {
 	}
 }
 
+// SyncWhatsAppHistory requests message history sync from WhatsApp servers
+// If chat_jid is provided, syncs only that contact. Otherwise, syncs all contacts.
+func (s *server) SyncWhatsAppHistory() http.HandlerFunc {
+	type requestBody struct {
+		ChatJID string `json:"chat_jid,omitempty"` // Optional: specific contact to sync
+		Days    int    `json:"days,omitempty"`     // Optional: number of days to sync (default: 10)
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		txtid := r.Context().Value("userinfo").(Values).Get("Id")
+
+		if clientManager.GetWhatsmeowClient(txtid) == nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
+			return
+		}
+
+		// Parse request body
+		var req requestBody
+		decoder := json.NewDecoder(r.Body)
+		err := decoder.Decode(&req)
+		if err != nil {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("could not decode request body"))
+			return
+		}
+
+		// Set default days if not provided
+		days := req.Days
+		if days <= 0 {
+			days = 10
+		}
+
+		// Calculate approximate message count based on days (estimate: 15 messages per day)
+		// This is a rough estimate - WhatsApp will return what it has available
+		count := days * 15
+		if count > 500 {
+			count = 500 // WhatsApp limit
+		}
+		if count < 50 {
+			count = 50 // Minimum reasonable count
+		}
+
+		myClient := clientManager.GetMyClient(txtid)
+		if myClient == nil || myClient.WAClient == nil || myClient.WAClient.Store == nil || myClient.WAClient.Store.ID == nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("client store not available"))
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		var syncedChats []string
+		var syncErrors []string
+
+		// If chat_jid is provided, sync only that contact
+		if req.ChatJID != "" {
+			chatJID, err := types.ParseJID(req.ChatJID)
+			if err != nil {
+				s.Respond(w, r, http.StatusBadRequest, fmt.Errorf("invalid chat_jid format: %w", err))
+				return
+			}
+
+			err = s.syncHistoryForChat(ctx, txtid, chatJID, count)
+			if err != nil {
+				syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", req.ChatJID, err))
+			} else {
+				syncedChats = append(syncedChats, req.ChatJID)
+			}
+		} else {
+			// Sync all contacts - get distinct chat_jids from message_history
+			var query string
+			if s.db.DriverName() == "postgres" {
+				query = `
+					SELECT DISTINCT chat_jid
+					FROM message_history
+					WHERE user_id = $1
+					ORDER BY chat_jid`
+			} else {
+				query = `
+					SELECT DISTINCT chat_jid
+					FROM message_history
+					WHERE user_id = ?
+					ORDER BY chat_jid`
+			}
+
+			var chatJIDs []string
+			err = s.db.Select(&chatJIDs, query, txtid)
+			if err != nil {
+				log.Warn().Err(err).Str("userID", txtid).Msg("Failed to get chat list from database, will try to get from WhatsApp")
+			}
+
+			// If no chats in database, try to get contacts from WhatsApp
+			if len(chatJIDs) == 0 {
+				contacts, err := clientManager.GetWhatsmeowClient(txtid).Store.Contacts.GetAllContacts(ctx)
+				if err == nil {
+					for jid := range contacts {
+						chatJIDs = append(chatJIDs, jid.String())
+					}
+				}
+
+				// Also get groups
+				groups, err := clientManager.GetWhatsmeowClient(txtid).GetJoinedGroups(ctx)
+				if err == nil {
+					for _, group := range groups {
+						chatJIDs = append(chatJIDs, group.JID.String())
+					}
+				}
+			}
+
+			if len(chatJIDs) == 0 {
+				s.Respond(w, r, http.StatusNotFound, errors.New("no contacts or chats found to sync"))
+				return
+			}
+
+			// Sync each chat
+			for _, chatJIDStr := range chatJIDs {
+				chatJID, err := types.ParseJID(chatJIDStr)
+				if err != nil {
+					log.Warn().Err(err).Str("chatJID", chatJIDStr).Msg("Failed to parse chat JID, skipping")
+					syncErrors = append(syncErrors, fmt.Sprintf("%s: invalid JID format", chatJIDStr))
+					continue
+				}
+
+				err = s.syncHistoryForChat(ctx, txtid, chatJID, count)
+				if err != nil {
+					log.Warn().Err(err).Str("chatJID", chatJIDStr).Msg("Failed to sync history for chat")
+					syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", chatJIDStr, err))
+				} else {
+					syncedChats = append(syncedChats, chatJIDStr)
+				}
+
+				// Small delay between requests to avoid overwhelming WhatsApp
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+
+		response := map[string]interface{}{
+			"success":      len(syncErrors) == 0,
+			"message":      "History sync requests sent to WhatsApp",
+			"days":         days,
+			"synced_chats": len(syncedChats),
+			"chats":        syncedChats,
+		}
+
+		if len(syncErrors) > 0 {
+			response["errors"] = syncErrors
+			response["error_count"] = len(syncErrors)
+		}
+
+		responseJson, err := json.Marshal(response)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, err)
+			return
+		}
+
+		s.Respond(w, r, http.StatusOK, string(responseJson))
+	}
+}
+
+// syncHistoryForChat syncs history for a specific chat
+func (s *server) syncHistoryForChat(ctx context.Context, userID string, chatJID types.JID, count int) error {
+	chatJIDStr := chatJID.String()
+
+	// Try to get last message info for this chat from database
+	var query string
+	if s.db.DriverName() == "postgres" {
+		query = `
+			SELECT message_id, chat_jid, sender_jid
+			FROM message_history
+			WHERE user_id = $1 AND chat_jid = $2
+			ORDER BY timestamp DESC
+			LIMIT 1`
+	} else {
+		query = `
+			SELECT message_id, chat_jid, sender_jid
+			FROM message_history
+			WHERE user_id = ? AND chat_jid = ?
+			ORDER BY timestamp DESC
+			LIMIT 1`
+	}
+
+	var lastMsg struct {
+		MessageID string `db:"message_id"`
+		ChatJID   string `db:"chat_jid"`
+		SenderJID string `db:"sender_jid"`
+	}
+
+	var lastMessageInfo *types.MessageInfo
+	err := s.db.Get(&lastMsg, query, userID, chatJIDStr)
+	if err == nil && lastMsg.MessageID != "" {
+		// Parse sender JID
+		var senderJID types.JID
+		if lastMsg.SenderJID != "" && lastMsg.SenderJID != "me" {
+			senderJID, _ = types.ParseJID(lastMsg.SenderJID)
+		} else {
+			senderJID = types.EmptyJID
+		}
+
+		// MessageInfo embeds MessageSource which contains Chat, Sender, IsGroup
+		lastMessageInfo = &types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:    chatJID,
+				Sender:  senderJID,
+				IsGroup: chatJID.Server == types.GroupServer || chatJID.Server == types.BroadcastServer,
+			},
+			ID: lastMsg.MessageID,
+		}
+	} else {
+		// If no last message found, create MessageInfo with just the chat
+		lastMessageInfo = &types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:    chatJID,
+				IsGroup: chatJID.Server == types.GroupServer || chatJID.Server == types.BroadcastServer,
+			},
+		}
+	}
+
+	// Build history sync request
+	historyMsg := clientManager.GetWhatsmeowClient(userID).BuildHistorySyncRequest(lastMessageInfo, count)
+	if historyMsg == nil {
+		return errors.New("failed to build history sync request")
+	}
+
+	// Send the history sync request
+	myClient := clientManager.GetMyClient(userID)
+	if myClient == nil || myClient.WAClient == nil || myClient.WAClient.Store == nil || myClient.WAClient.Store.ID == nil {
+		return errors.New("client store not available")
+	}
+
+	_, err = clientManager.GetWhatsmeowClient(userID).SendMessage(
+		ctx,
+		myClient.WAClient.Store.ID.ToNonAD(),
+		historyMsg,
+		whatsmeow.SendRequestExtra{Peer: true},
+	)
+
+	if err != nil {
+		log.Error().
+			Str("userID", userID).
+			Str("chatJID", chatJIDStr).
+			Err(err).
+			Msg("Failed to send WhatsApp history sync request")
+		return fmt.Errorf("failed to send history sync request: %w", err)
+	}
+
+	log.Info().
+		Str("userID", userID).
+		Str("chatJID", chatJIDStr).
+		Int("count", count).
+		Msg("WhatsApp history sync request sent successfully")
+
+	return nil
+}
+
 // save outgoing message to history
 func (s *server) saveOutgoingMessageToHistory(userID, chatJID, messageID, messageType, textContent, mediaLink string, historyLimit int) {
 	if historyLimit > 0 {

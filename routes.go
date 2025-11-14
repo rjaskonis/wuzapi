@@ -122,6 +122,7 @@ func (s *server) routes() {
 	s.router.Handle("/chat/send/poll", c.Then(s.SendPoll())).Methods("POST")
 	s.router.Handle("/chat/send/edit", c.Then(s.SendEditMessage())).Methods("POST")
 	s.router.Handle("/chat/history", c.Then(s.GetHistory())).Methods("GET")
+	s.router.Handle("/chat/whatsapp-history", c.Then(s.SyncWhatsAppHistory())).Methods("POST")
 	s.router.Handle("/chat/request-unavailable-message", c.Then(s.RequestUnavailableMessage())).Methods("POST")
 	s.router.Handle("/chat/archive", c.Then(s.ArchiveChat())).Methods("POST")
 
