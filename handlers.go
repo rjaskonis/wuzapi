@@ -156,45 +156,124 @@ func (s *server) authalice(next http.Handler) http.Handler {
 		myuserinfo, found := userinfocache.Get(token)
 		if !found {
 			log.Info().Msg("Looking for user information in DB")
-			// Checks DB from matching user and store user values in context
-			rows, err := s.db.Query("SELECT id,name,webhook,jid,events,proxy_url,qrcode,history,hmac_key IS NOT NULL AND length(hmac_key) > 0 FROM users WHERE token=$1 LIMIT 1", token)
-			if err != nil {
-				s.Respond(w, r, http.StatusInternalServerError, err)
+			// Ensure database connection is healthy before querying
+			if err := s.ensureDBConnection(); err != nil {
+				log.Error().Err(err).Msg("Database connection check failed")
+				s.Respond(w, r, http.StatusInternalServerError, fmt.Errorf("database error: %w", err))
 				return
 			}
-			defer rows.Close()
-			var history sql.NullInt64
-			for rows.Next() {
-				err = rows.Scan(&txtid, &name, &webhook, &jid, &events, &proxy_url, &qrcode, &history, &hasHmac)
+			// Checks DB from matching user and store user values in context
+			// Try multiple query variations to handle different database schemas
+			var rows *sql.Rows
+			var err error
+			queryType := "full_with_hmac" // full_with_hmac, full_without_hmac, or minimal
+			
+			// Try full query with hmac_key first
+			queryWithHmac := "SELECT id,name,webhook,jid,events,proxy_url,qrcode,history,COALESCE((hmac_key IS NOT NULL AND length(hmac_key) > 0), false) FROM users WHERE token=$1 LIMIT 1"
+			if s.db.DriverName() == "sqlite" {
+				queryWithHmac = strings.ReplaceAll(queryWithHmac, "$1", "?")
+			}
+			rows, err = s.db.Query(queryWithHmac, token)
+			if err != nil {
+				// If query fails, try without hmac_key
+				log.Warn().Err(err).Msg("Failed to query with hmac_key, trying without it")
+				queryWithoutHmac := "SELECT id,name,webhook,jid,events,proxy_url,qrcode,history FROM users WHERE token=$1 LIMIT 1"
+				if s.db.DriverName() == "sqlite" {
+					queryWithoutHmac = strings.ReplaceAll(queryWithoutHmac, "$1", "?")
+				}
+				rows, err = s.db.Query(queryWithoutHmac, token)
 				if err != nil {
-					s.Respond(w, r, http.StatusInternalServerError, err)
+					// If that also fails, try minimal query with just id
+					log.Warn().Err(err).Msg("Failed to query with full columns, trying minimal query")
+					queryMinimal := "SELECT id FROM users WHERE token=$1 LIMIT 1"
+					if s.db.DriverName() == "sqlite" {
+						queryMinimal = strings.ReplaceAll(queryMinimal, "$1", "?")
+					}
+					rows, err = s.db.Query(queryMinimal, token)
+					if err != nil {
+						// Check if error is due to missing token column
+						errStr := err.Error()
+						if strings.Contains(errStr, "column") && strings.Contains(errStr, "token") && strings.Contains(errStr, "does not exist") {
+							log.Error().Err(err).Msg("Token column does not exist in users table - database schema is invalid. Please run database migrations.")
+							s.Respond(w, r, http.StatusInternalServerError, fmt.Errorf("database error: users table is missing required 'token' column. Please run database migrations to fix the schema."))
+						} else {
+							log.Error().Err(err).Msg("Failed to query users table - database schema may be corrupted or table doesn't exist")
+							s.Respond(w, r, http.StatusInternalServerError, fmt.Errorf("database error: unable to query users table - %w", err))
+						}
+						return
+					}
+					queryType = "minimal"
+				} else {
+					queryType = "full_without_hmac"
+				}
+			}
+			defer rows.Close()
+			
+			var history sql.NullInt64
+			history.Valid = false
+			foundRow := false
+			
+			for rows.Next() {
+				foundRow = true
+				// Scan based on which query succeeded
+				if queryType == "full_with_hmac" {
+					err = rows.Scan(&txtid, &name, &webhook, &jid, &events, &proxy_url, &qrcode, &history, &hasHmac)
+				} else if queryType == "full_without_hmac" {
+					err = rows.Scan(&txtid, &name, &webhook, &jid, &events, &proxy_url, &qrcode, &history)
+					hasHmac = false
+				} else {
+					// minimal query - only id
+					err = rows.Scan(&txtid)
+					if err == nil {
+						// Minimal query succeeded, set defaults for other fields
+						name = ""
+						webhook = ""
+						jid = ""
+						events = ""
+						proxy_url = ""
+						qrcode = ""
+						hasHmac = false
+					}
+				}
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to scan user data")
+					s.Respond(w, r, http.StatusInternalServerError, fmt.Errorf("failed to read user data: %w", err))
 					return
 				}
-				historyStr := "0"
-				if history.Valid {
-					historyStr = fmt.Sprintf("%d", history.Int64)
-				}
-
-				// Debug logging for history value
-				log.Debug().Str("userId", txtid).Bool("historyValid", history.Valid).Int64("historyValue", history.Int64).Str("historyStr", historyStr).Msg("User authentication - history debug")
-
-				v := Values{map[string]string{
-					"Id":      txtid,
-					"Name":    name,
-					"Jid":     jid,
-					"Webhook": webhook,
-					"Token":   token,
-					"Proxy":   proxy_url,
-					"Events":  events,
-					"Qrcode":  qrcode,
-					"History": historyStr,
-					"HasHmac": strconv.FormatBool(hasHmac),
-				}}
-
-				userinfocache.Set(token, v, cache.NoExpiration)
-				log.Info().Str("name", name).Msg("User info name from DB")
-				ctx = context.WithValue(r.Context(), "userinfo", v)
+				break // Only process first row
 			}
+			
+			if !foundRow {
+				// No rows found - invalid token
+				log.Warn().Str("token", token).Msg("No user found with this token")
+				s.Respond(w, r, http.StatusUnauthorized, errors.New("unauthorized"))
+				return
+			}
+			
+			historyStr := "0"
+			if history.Valid {
+				historyStr = fmt.Sprintf("%d", history.Int64)
+			}
+
+			// Debug logging for history value
+			log.Debug().Str("userId", txtid).Bool("historyValid", history.Valid).Int64("historyValue", history.Int64).Str("historyStr", historyStr).Msg("User authentication - history debug")
+
+			v := Values{map[string]string{
+				"Id":      txtid,
+				"Name":    name,
+				"Jid":     jid,
+				"Webhook": webhook,
+				"Token":   token,
+				"Proxy":   proxy_url,
+				"Events":  events,
+				"Qrcode":  qrcode,
+				"History": historyStr,
+				"HasHmac": strconv.FormatBool(hasHmac),
+			}}
+
+			userinfocache.Set(token, v, cache.NoExpiration)
+			log.Info().Str("name", name).Msg("User info name from DB")
+			ctx = context.WithValue(r.Context(), "userinfo", v)
 		} else {
 			ctx = context.WithValue(r.Context(), "userinfo", myuserinfo)
 			log.Info().Str("name", myuserinfo.(Values).Get("name")).Msg("User info name from Cache")
@@ -752,28 +831,44 @@ func (s *server) GetStatus() http.HandlerFunc {
 			"media_delivery": "",
 			"retention_days": 0,
 		}
-		err := s.db.QueryRow(`SELECT COALESCE(s3_enabled, false), COALESCE(s3_endpoint, ''), COALESCE(s3_region, ''), COALESCE(s3_bucket, ''), COALESCE(s3_path_style, false), COALESCE(s3_public_url, ''), COALESCE(media_delivery, ''), COALESCE(s3_retention_days, 0) FROM users WHERE id = $1`, txtid).Scan(&s3Enabled, &s3Endpoint, &s3Region, &s3Bucket, &s3PathStyle, &s3PublicURL, &s3MediaDelivery, &s3RetentionDays)
-
-		if err == nil {
-			// Overwrite defaults with actual values if the query succeeded
-			s3Config["enabled"] = s3Enabled
-			s3Config["endpoint"] = s3Endpoint
-			s3Config["region"] = s3Region
-			s3Config["bucket"] = s3Bucket
-			s3Config["path_style"] = s3PathStyle
-			s3Config["public_url"] = s3PublicURL
-			s3Config["media_delivery"] = s3MediaDelivery
-			s3Config["retention_days"] = s3RetentionDays
-		} else {
-			if err != sql.ErrNoRows {
+		
+		// Check if S3 columns exist before querying
+		hasS3Columns, err := s.checkColumnExists("users", "s3_enabled")
+		if err == nil && hasS3Columns {
+			query := `SELECT COALESCE(s3_enabled, false), COALESCE(s3_endpoint, ''), COALESCE(s3_region, ''), COALESCE(s3_bucket, ''), COALESCE(s3_path_style, false), COALESCE(s3_public_url, ''), COALESCE(media_delivery, ''), COALESCE(s3_retention_days, 0) FROM users WHERE id = $1`
+			if s.db.DriverName() == "sqlite" {
+				query = strings.ReplaceAll(query, "$1", "?")
+			}
+			err = s.db.QueryRow(query, txtid).Scan(&s3Enabled, &s3Endpoint, &s3Region, &s3Bucket, &s3PathStyle, &s3PublicURL, &s3MediaDelivery, &s3RetentionDays)
+			if err == nil {
+				// Overwrite defaults with actual values if the query succeeded
+				s3Config["enabled"] = s3Enabled
+				s3Config["endpoint"] = s3Endpoint
+				s3Config["region"] = s3Region
+				s3Config["bucket"] = s3Bucket
+				s3Config["path_style"] = s3PathStyle
+				s3Config["public_url"] = s3PublicURL
+				s3Config["media_delivery"] = s3MediaDelivery
+				s3Config["retention_days"] = s3RetentionDays
+			} else if err != sql.ErrNoRows {
 				log.Warn().Err(err).Str("user_id", txtid).Msg("Failed to query S3 config for user")
 			}
 		}
 
 		var hmacKey []byte
-		err = s.db.QueryRow("SELECT hmac_key FROM users WHERE id = $1", txtid).Scan(&hmacKey)
-		if err != nil && err != sql.ErrNoRows {
-			log.Error().Err(err).Str("userID", txtid).Msg("Failed to query HMAC key")
+		queryHmac := "SELECT hmac_key FROM users WHERE id = $1"
+		if s.db.DriverName() == "sqlite" {
+			queryHmac = strings.ReplaceAll(queryHmac, "$1", "?")
+		}
+		err = s.db.QueryRow(queryHmac, txtid).Scan(&hmacKey)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				hmacKey = nil
+			} else {
+				// Column might not exist, log warning but continue
+				log.Warn().Err(err).Str("userID", txtid).Msg("Failed to query HMAC key (column may not exist)")
+				hmacKey = nil
+			}
 		}
 		hmacConfigured := len(hmacKey) > 0
 
@@ -2222,6 +2317,38 @@ func (s *server) SendMessage() http.HandlerFunc {
 		historyStr := r.Context().Value("userinfo").(Values).Get("History")
 		historyLimit, _ := strconv.Atoi(historyStr)
 		s.saveOutgoingMessageToHistory(txtid, recipient.String(), msgid, "text", t.Body, "", historyLimit)
+
+		// Notify Chatwoot about outgoing message
+		go func() {
+			// Extract phone/jid from recipient
+			phone := ""
+			var lid, jid string
+			recipientStr := recipient.String()
+			if strings.HasSuffix(recipientStr, "@lid") {
+				lid = recipientStr
+			} else if strings.HasSuffix(recipientStr, "@s.whatsapp.net") {
+				jid = recipientStr
+				phone = strings.TrimSuffix(recipientStr, "@s.whatsapp.net")
+			} else {
+				phone = recipientStr
+			}
+			
+			// Normalize phone to E164 format if we have a phone number
+			if phone != "" {
+				defaultCountry := os.Getenv("DEFAULT_COUNTRY")
+				if defaultCountry == "" {
+					defaultCountry = "BR"
+				}
+				phone = normalizeToE164(phone, defaultCountry)
+			}
+			
+			err := s.ProcessOutgoingMessage(txtid, phone, t.Body, lid, jid, nil, nil, nil, nil, msgid, nil)
+			if err != nil {
+				log.Warn().Err(err).Str("messageID", msgid).Msg("Failed to send outgoing message to Chatwoot")
+			} else {
+				log.Info().Str("messageID", msgid).Msg("Outgoing message sent to Chatwoot successfully")
+			}
+		}()
 
 		log.Info().Str("timestamp", fmt.Sprintf("%v", resp.Timestamp)).Str("id", msgid).Msg("Message sent")
 		response := map[string]interface{}{"Details": "Sent", "Timestamp": resp.Timestamp.Unix(), "Id": msgid}
@@ -4495,6 +4622,13 @@ func (s *server) ListUsers() http.HandlerFunc {
 		vars := mux.Vars(r)
 		userID, hasID := vars["id"]
 
+		// Ensure database connection is healthy before querying
+		if err := s.ensureDBConnection(); err != nil {
+			log.Error().Err(err).Msg("Database connection check failed")
+			s.Respond(w, r, http.StatusInternalServerError, fmt.Errorf("database error: %w", err))
+			return
+		}
+
 		var query string
 		var args []interface{}
 
@@ -4509,6 +4643,7 @@ func (s *server) ListUsers() http.HandlerFunc {
 
 		rows, err := s.db.Queryx(query, args...)
 		if err != nil {
+			log.Error().Err(err).Msg("Failed to query users from database")
 			s.Respond(w, r, http.StatusInternalServerError, errors.New("problem accessing DB"))
 			return
 		}
@@ -4573,19 +4708,25 @@ func (s *server) ListUsers() http.HandlerFunc {
 				"media_delivery": "",
 				"retention_days": 0,
 			}
-			err = s.db.QueryRow(`SELECT COALESCE(s3_enabled, false), COALESCE(s3_endpoint, ''), COALESCE(s3_region, ''), COALESCE(s3_bucket, ''), COALESCE(s3_path_style, false), COALESCE(s3_public_url, ''), COALESCE(media_delivery, ''), COALESCE(s3_retention_days, 0) FROM users WHERE id = $1`, user.Id).Scan(&s3Enabled, &s3Endpoint, &s3Region, &s3Bucket, &s3PathStyle, &s3PublicURL, &s3MediaDelivery, &s3RetentionDays)
-			if err == nil {
-				// Overwrite defaults with actual values if the query succeeded
-				s3Config["enabled"] = s3Enabled
-				s3Config["endpoint"] = s3Endpoint
-				s3Config["region"] = s3Region
-				s3Config["bucket"] = s3Bucket
-				s3Config["path_style"] = s3PathStyle
-				s3Config["public_url"] = s3PublicURL
-				s3Config["media_delivery"] = s3MediaDelivery
-				s3Config["retention_days"] = s3RetentionDays
-			} else {
-				if err != sql.ErrNoRows {
+			// Check if S3 columns exist before querying
+			hasS3Columns, err := s.checkColumnExists("users", "s3_enabled")
+			if err == nil && hasS3Columns {
+				query := `SELECT COALESCE(s3_enabled, false), COALESCE(s3_endpoint, ''), COALESCE(s3_region, ''), COALESCE(s3_bucket, ''), COALESCE(s3_path_style, false), COALESCE(s3_public_url, ''), COALESCE(media_delivery, ''), COALESCE(s3_retention_days, 0) FROM users WHERE id = $1`
+				if s.db.DriverName() == "sqlite" {
+					query = strings.ReplaceAll(query, "$1", "?")
+				}
+				err = s.db.QueryRow(query, user.Id).Scan(&s3Enabled, &s3Endpoint, &s3Region, &s3Bucket, &s3PathStyle, &s3PublicURL, &s3MediaDelivery, &s3RetentionDays)
+				if err == nil {
+					// Overwrite defaults with actual values if the query succeeded
+					s3Config["enabled"] = s3Enabled
+					s3Config["endpoint"] = s3Endpoint
+					s3Config["region"] = s3Region
+					s3Config["bucket"] = s3Bucket
+					s3Config["path_style"] = s3PathStyle
+					s3Config["public_url"] = s3PublicURL
+					s3Config["media_delivery"] = s3MediaDelivery
+					s3Config["retention_days"] = s3RetentionDays
+				} else if err != sql.ErrNoRows {
 					log.Warn().Err(err).Str("user_id", user.Id).Msg("Failed to query S3 config for user")
 				}
 			}
@@ -5178,15 +5319,22 @@ func (s *server) DeleteUserComplete() http.HandlerFunc {
 
 		// 5. Remove files from S3 (if enabled)
 		var s3Enabled bool
-		err = s.db.QueryRow("SELECT s3_enabled FROM users WHERE id = $1", id).Scan(&s3Enabled)
-		if err == nil && s3Enabled {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			errS3 := GetS3Manager().DeleteAllUserObjects(ctx, id)
-			if errS3 != nil {
-				log.Error().Err(errS3).Str("id", id).Msg("error removing user files from S3")
-			} else {
-				log.Info().Str("id", id).Msg("user files from S3 removed successfully")
+		hasS3Columns, _ := s.checkColumnExists("users", "s3_enabled")
+		if hasS3Columns {
+			query := "SELECT s3_enabled FROM users WHERE id = $1"
+			if s.db.DriverName() == "sqlite" {
+				query = strings.ReplaceAll(query, "$1", "?")
+			}
+			err = s.db.QueryRow(query, id).Scan(&s3Enabled)
+			if err == nil && s3Enabled {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				errS3 := GetS3Manager().DeleteAllUserObjects(ctx, id)
+				if errS3 != nil {
+					log.Error().Err(errS3).Str("id", id).Msg("error removing user files from S3")
+				} else {
+					log.Info().Str("id", id).Msg("user files from S3 removed successfully")
+				}
 			}
 		}
 
@@ -6663,7 +6811,11 @@ func (s *server) GetHmacConfig() http.HandlerFunc {
 		txtid := r.Context().Value("userinfo").(Values).Get("Id")
 
 		var hmacKey []byte
-		err := s.db.QueryRow(`SELECT hmac_key FROM users WHERE id = $1`, txtid).Scan(&hmacKey)
+		queryHmac := `SELECT hmac_key FROM users WHERE id = $1`
+		if s.db.DriverName() == "sqlite" {
+			queryHmac = strings.ReplaceAll(queryHmac, "$1", "?")
+		}
+		err := s.db.QueryRow(queryHmac, txtid).Scan(&hmacKey)
 
 		if err != nil {
 			if err == sql.ErrNoRows {
@@ -6673,9 +6825,10 @@ func (s *server) GetHmacConfig() http.HandlerFunc {
 				return
 			}
 
-			log.Error().Err(err).Str("userID", txtid).Msg("Failed to get HMAC configuration from database")
-			s.respondWithJSON(w, http.StatusInternalServerError, map[string]interface{}{
-				"error": "failed to get HMAC configuration",
+			// Column might not exist, return empty key instead of error
+			log.Warn().Err(err).Str("userID", txtid).Msg("Failed to get HMAC configuration (column may not exist)")
+			s.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+				"hmac_key": "",
 			})
 			return
 		}
@@ -6727,13 +6880,16 @@ func (s *server) DeleteHmacConfig() http.HandlerFunc {
 // Configure Chatwoot
 func (s *server) ConfigureChatwoot() http.HandlerFunc {
 	type chatwootConfigStruct struct {
-		BaseURL       string `json:"base_url"`
-		AccountID     string `json:"account_id"`
-		APIToken      string `json:"api_token"`
-		InboxName     string `json:"inbox_name"`
-		SignMsg       bool   `json:"sign_msg"`
-		SignDelimiter string `json:"sign_delimiter"`
-		MarkRead      bool   `json:"mark_read"`
+		BaseURL                  string `json:"base_url"`
+		AccountID                string `json:"account_id"`
+		APIToken                 string `json:"api_token"`
+		InboxName                string `json:"inbox_name"`
+		SignMsg                  bool   `json:"sign_msg"`
+		SignDelimiter            string `json:"sign_delimiter"`
+		MarkRead                 bool   `json:"mark_read"`
+		ImportMessages           bool   `json:"import_messages"`
+		ImportDatabaseConnectionURI string `json:"import_database_connection_uri"`
+		ImportDatabaseSSL           bool   `json:"import_database_ssl"`
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -6754,7 +6910,7 @@ func (s *server) ConfigureChatwoot() http.HandlerFunc {
 		}
 
 		// Update database
-		_, err = s.db.Exec(`
+		query := `
 			UPDATE users SET 
 				chatwoot_base_url = $1,
 				chatwoot_account_id = $2,
@@ -6762,9 +6918,26 @@ func (s *server) ConfigureChatwoot() http.HandlerFunc {
 				chatwoot_inbox_name = $4,
 				chatwoot_sign_msg = $5,
 				chatwoot_sign_delimiter = $6,
-				chatwoot_mark_read = $7
-			WHERE id = $8`,
-			t.BaseURL, t.AccountID, t.APIToken, t.InboxName, t.SignMsg, signDelimiter, t.MarkRead, txtid)
+				chatwoot_mark_read = $7,
+				chatwoot_import_messages = $8,
+				chatwoot_import_database_connection_uri = $9,
+				chatwoot_import_database_ssl = $10
+			WHERE id = $11`
+		if s.db.DriverName() == "sqlite" {
+			query = strings.ReplaceAll(query, "$1", "?")
+			query = strings.ReplaceAll(query, "$2", "?")
+			query = strings.ReplaceAll(query, "$3", "?")
+			query = strings.ReplaceAll(query, "$4", "?")
+			query = strings.ReplaceAll(query, "$5", "?")
+			query = strings.ReplaceAll(query, "$6", "?")
+			query = strings.ReplaceAll(query, "$7", "?")
+			query = strings.ReplaceAll(query, "$8", "?")
+			query = strings.ReplaceAll(query, "$9", "?")
+			query = strings.ReplaceAll(query, "$10", "?")
+			query = strings.ReplaceAll(query, "$11", "?")
+		}
+		_, err = s.db.Exec(query,
+			t.BaseURL, t.AccountID, t.APIToken, t.InboxName, t.SignMsg, signDelimiter, t.MarkRead, t.ImportMessages, t.ImportDatabaseConnectionURI, t.ImportDatabaseSSL, txtid)
 
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New("failed to save Chatwoot configuration"))
@@ -6785,16 +6958,19 @@ func (s *server) GetChatwootConfig() http.HandlerFunc {
 		txtid := r.Context().Value("userinfo").(Values).Get("Id")
 
 		var config struct {
-			BaseURL       string `json:"base_url" db:"base_url"`
-			AccountID     string `json:"account_id" db:"account_id"`
-			APIToken      string `json:"api_token" db:"api_token"`
-			InboxName     string `json:"inbox_name" db:"inbox_name"`
-			SignMsg       bool   `json:"sign_msg" db:"sign_msg"`
-			SignDelimiter string `json:"sign_delimiter" db:"sign_delimiter"`
-			MarkRead      bool   `json:"mark_read" db:"mark_read"`
+			BaseURL                  string `json:"base_url" db:"base_url"`
+			AccountID                string `json:"account_id" db:"account_id"`
+			APIToken                 string `json:"api_token" db:"api_token"`
+			InboxName                string `json:"inbox_name" db:"inbox_name"`
+			SignMsg                  bool   `json:"sign_msg" db:"sign_msg"`
+			SignDelimiter            string `json:"sign_delimiter" db:"sign_delimiter"`
+			MarkRead                 bool   `json:"mark_read" db:"mark_read"`
+			ImportMessages            bool   `json:"import_messages" db:"import_messages"`
+			ImportDatabaseConnectionURI string `json:"import_database_connection_uri" db:"import_database_connection_uri"`
+			ImportDatabaseSSL         bool   `json:"import_database_ssl" db:"import_database_ssl"`
 		}
 
-		err := s.db.Get(&config, `
+		query := `
 			SELECT 
 				chatwoot_base_url as base_url,
 				chatwoot_account_id as account_id,
@@ -6802,8 +6978,15 @@ func (s *server) GetChatwootConfig() http.HandlerFunc {
 				chatwoot_inbox_name as inbox_name,
 				COALESCE(chatwoot_sign_msg, false) as sign_msg,
 				COALESCE(chatwoot_sign_delimiter, '\n') as sign_delimiter,
-				COALESCE(chatwoot_mark_read, false) as mark_read
-			FROM users WHERE id = $1`, txtid)
+				COALESCE(chatwoot_mark_read, false) as mark_read,
+				COALESCE(chatwoot_import_messages, true) as import_messages,
+				COALESCE(chatwoot_import_database_connection_uri, '') as import_database_connection_uri,
+				COALESCE(chatwoot_import_database_ssl, false) as import_database_ssl
+			FROM users WHERE id = $1`
+		if s.db.DriverName() == "sqlite" {
+			query = strings.ReplaceAll(query, "$1", "?")
+		}
+		err := s.db.Get(&config, query, txtid)
 
 		if err != nil {
 			log.Error().Err(err).Str("userID", txtid).Msg("Failed to get Chatwoot configuration from database")
@@ -6817,15 +7000,84 @@ func (s *server) GetChatwootConfig() http.HandlerFunc {
 
 		log.Debug().Str("userID", txtid).Str("base_url", config.BaseURL).Str("account_id", config.AccountID).Str("inbox_name", config.InboxName).Msg("Retrieved Chatwoot configuration from database")
 
-		// Don't return API token for security
-		config.APIToken = "***" // Mask API token
-
 		response := map[string]interface{}{
 			"code":    200,
 			"success": true,
 			"data":    config,
 		}
 		s.respondWithJSON(w, http.StatusOK, response)
+	}
+}
+
+// TestChatwootImportDatabase tests the connection to Chatwoot's import database
+func (s *server) TestChatwootImportDatabase() http.HandlerFunc {
+	type testDBRequest struct {
+		ConnectionURI string `json:"connection_uri"`
+		UseSSL        bool   `json:"use_ssl"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		decoder := json.NewDecoder(r.Body)
+		var req testDBRequest
+		err := decoder.Decode(&req)
+		if err != nil {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("could not decode payload"))
+			return
+		}
+
+		if req.ConnectionURI == "" {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("connection_uri is required"))
+			return
+		}
+
+		// Build connection URI with SSL setting
+		connectionURI := buildDatabaseConnectionURI(req.ConnectionURI, req.UseSSL)
+
+		// Test the connection
+		testDB, err := sql.Open("postgres", connectionURI)
+		if err != nil {
+			s.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+				"success": false,
+				"error":   fmt.Sprintf("Failed to open connection: %v", err),
+			})
+			return
+		}
+		defer testDB.Close()
+
+		// Try to ping the database
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		err = testDB.PingContext(ctx)
+		if err != nil {
+			s.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+				"success": false,
+				"error":   fmt.Sprintf("Failed to connect to database: %v", err),
+			})
+			return
+		}
+
+		// Try to query a simple table to verify it's a Chatwoot database
+		var tableExists bool
+		err = testDB.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT FROM information_schema.tables 
+				WHERE table_schema = 'public' 
+				AND table_name IN ('contacts', 'conversations', 'messages')
+			)`).Scan(&tableExists)
+
+		if err != nil || !tableExists {
+			s.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+				"success": false,
+				"error":   "Database connected but doesn't appear to be a Chatwoot database (missing required tables)",
+			})
+			return
+		}
+
+		s.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Connection successful",
+		})
 	}
 }
 
@@ -6901,6 +7153,18 @@ func (s *server) CreateChatwootInbox() http.HandlerFunc {
 			log.Warn().Err(err).Msg("Failed to store inbox ID")
 		}
 		
+		// Import chat history if import messages is enabled and import database URI is configured
+		// Update config with the new inbox ID before importing
+		config.InboxID = fmt.Sprintf("%d", inbox.ID)
+		if config.ImportMessages && config.ImportDatabaseConnectionURI != "" {
+			go func() {
+				log.Info().Str("userID", txtid).Msg("Starting chat history import in background")
+				if err := s.ImportChatHistory(txtid, config); err != nil {
+					log.Error().Err(err).Str("userID", txtid).Msg("Failed to import chat history")
+				}
+			}()
+		}
+		
 		s.respondWithJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"message": "Inbox created successfully",
@@ -6949,6 +7213,18 @@ func (s *server) ChatwootWebhookCallback() http.HandlerFunc {
 				"message": "Not an outgoing message",
 			})
 			return
+		}
+		
+		// Check if message originated from WhatsApp (has source_id starting with "WAID:")
+		// This prevents duplicate messages when messages sent from WhatsApp are forwarded to Chatwoot
+		if sourceID, ok := payload["source_id"].(string); ok && sourceID != "" {
+			if strings.HasPrefix(sourceID, "WAID:") {
+				s.respondWithJSON(w, http.StatusOK, map[string]interface{}{
+					"success": true,
+					"message": "Message originated from WhatsApp, ignoring webhook to prevent duplicate",
+				})
+				return
+			}
 		}
 		
 		// Check if it's a private message

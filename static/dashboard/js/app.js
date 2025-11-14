@@ -350,11 +350,17 @@ document.addEventListener('DOMContentLoaded', function() {
     $('#createChatwootInbox').off('click').on('click', function() {
       createChatwootInbox();
     });
+    // Add click handler for test import database button
+    $('#testChatwootImportDb').off('click').on('click', function() {
+      testChatwootImportDatabase();
+    });
     loadChatwootConfig();
     
     // Initialize Semantic UI checkboxes
     $('#chatwootSignMsg').checkbox();
     $('#chatwootMarkRead').checkbox();
+    $('#chatwootImportDatabaseSsl').checkbox();
+    $('#chatwootImportMessages').checkbox();
     
     // Initialize checkbox change handler
     $('#chatwootSignMsg').off('change').on('change', function() {
@@ -2037,9 +2043,6 @@ async function loadChatwootConfig() {
   const myHeaders = new Headers();
   myHeaders.append('token', token);
   
-  // Get cached API token from sessionStorage if available
-  const cachedApiToken = sessionStorage.getItem('chatwoot_api_token') || '';
-  
   try {
     const res = await fetch(baseUrl + "/session/chatwoot/config", {
       method: "GET",
@@ -2051,28 +2054,10 @@ async function loadChatwootConfig() {
       if (data.code === 200 && data.data) {
         $('#chatwootBaseUrl').val(data.data.base_url || '');
         $('#chatwootAccountId').val(data.data.account_id || '');
-        // If API token is masked, use cached value if available, otherwise keep current value
-        if (data.data.api_token === '***') {
-          // If we have a cached value, use it; otherwise keep what's already in the field
-          if (cachedApiToken) {
-            $('#chatwootApiToken').val(cachedApiToken);
-          } else {
-            // Don't clear if user has already entered something
-            const currentValue = $('#chatwootApiToken').val();
-            if (!currentValue) {
-              $('#chatwootApiToken').val('');
-            }
-          }
-        } else {
-          $('#chatwootApiToken').val(data.data.api_token || '');
-          // Cache the API token for future use
-          if (data.data.api_token) {
-            sessionStorage.setItem('chatwoot_api_token', data.data.api_token);
-          }
-        }
+        $('#chatwootApiToken').val(data.data.api_token || '');
         $('#chatwootInboxName').val(data.data.inbox_name || '');
         // Load sign message settings
-        const signMsg = data.data.sign_msg || false;
+        const signMsg = data.data.sign_msg !== undefined ? data.data.sign_msg : true;
         $('#chatwootSignMsg').prop('checked', signMsg);
         $('#chatwootSignDelimiter').val(data.data.sign_delimiter || '\\n');
         // Show/hide delimiter field based on checkbox
@@ -2081,28 +2066,31 @@ async function loadChatwootConfig() {
         } else {
           $('#chatwootSignDelimiterField').hide();
         }
-        // Load mark read setting
-        $('#chatwootMarkRead').prop('checked', data.data.mark_read || false);
+        // Load mark read setting (default to true)
+        $('#chatwootMarkRead').prop('checked', data.data.mark_read !== undefined ? data.data.mark_read : true);
+        // Load import messages setting (default to false)
+        $('#chatwootImportMessages').prop('checked', data.data.import_messages || false);
+        // Load import database URI
+        $('#chatwootImportDatabaseUri').val(data.data.import_database_connection_uri || '');
+        // Load import database SSL setting
+        $('#chatwootImportDatabaseSsl').prop('checked', data.data.import_database_ssl || false);
       } else {
-        // No config found, set defaults but preserve API token if cached
+        // No config found, set defaults
         $('#chatwootBaseUrl').val('');
         $('#chatwootAccountId').val('');
-        $('#chatwootApiToken').val(cachedApiToken || '');
+        $('#chatwootApiToken').val('');
         $('#chatwootInboxName').val('');
-        $('#chatwootSignMsg').prop('checked', false);
+        $('#chatwootSignMsg').prop('checked', true);
         $('#chatwootSignDelimiter').val('\\n');
-        $('#chatwootSignDelimiterField').hide();
-        $('#chatwootMarkRead').prop('checked', false);
+        $('#chatwootSignDelimiterField').show();
+        $('#chatwootMarkRead').prop('checked', true);
+        $('#chatwootImportMessages').prop('checked', false);
+        $('#chatwootImportDatabaseUri').val('');
+        $('#chatwootImportDatabaseSsl').prop('checked', false);
       }
     }
   } catch (error) {
     console.error('Error loading Chatwoot config:', error);
-    // On error, preserve existing values
-    const currentApiToken = $('#chatwootApiToken').val() || cachedApiToken;
-    $('#chatwootBaseUrl').val($('#chatwootBaseUrl').val() || '');
-    $('#chatwootAccountId').val($('#chatwootAccountId').val() || '');
-    $('#chatwootApiToken').val(currentApiToken);
-    $('#chatwootInboxName').val($('#chatwootInboxName').val() || '');
     
     // Initialize checkbox behavior
     $('#chatwootSignMsg').on('change', function() {
@@ -2121,22 +2109,18 @@ async function saveChatwootConfig() {
   myHeaders.append('token', token);
   myHeaders.append('Content-Type', 'application/json');
   
-  const apiTokenValue = $('#chatwootApiToken').val().trim();
-  
   const config = {
     base_url: $('#chatwootBaseUrl').val().trim(),
     account_id: $('#chatwootAccountId').val().trim(),
-    api_token: apiTokenValue,
+    api_token: $('#chatwootApiToken').val().trim(),
     inbox_name: $('#chatwootInboxName').val().trim(),
     sign_msg: $('#chatwootSignMsg').is(':checked'),
     sign_delimiter: $('#chatwootSignDelimiter').val().trim() || '\\n',
-    mark_read: $('#chatwootMarkRead').is(':checked')
+    mark_read: $('#chatwootMarkRead').is(':checked'),
+    import_messages: $('#chatwootImportMessages').is(':checked'),
+    import_database_connection_uri: $('#chatwootImportDatabaseUri').val().trim(),
+    import_database_ssl: $('#chatwootImportDatabaseSsl').is(':checked')
   };
-  
-  // Cache the API token in sessionStorage so it persists when reopening
-  if (apiTokenValue) {
-    sessionStorage.setItem('chatwoot_api_token', apiTokenValue);
-  }
   
   try {
     const res = await fetch(baseUrl + "/session/chatwoot/config", {
@@ -2165,21 +2149,18 @@ async function createChatwootInbox() {
   myHeaders.append('Content-Type', 'application/json');
   
   // First, save the Chatwoot configuration
-  const apiTokenValue = $('#chatwootApiToken').val().trim();
   const config = {
     base_url: $('#chatwootBaseUrl').val().trim(),
     account_id: $('#chatwootAccountId').val().trim(),
-    api_token: apiTokenValue,
+    api_token: $('#chatwootApiToken').val().trim(),
     inbox_name: $('#chatwootInboxName').val().trim(),
     sign_msg: $('#chatwootSignMsg').is(':checked'),
     sign_delimiter: $('#chatwootSignDelimiter').val().trim() || '\\n',
-    mark_read: $('#chatwootMarkRead').is(':checked')
+    mark_read: $('#chatwootMarkRead').is(':checked'),
+    import_messages: $('#chatwootImportMessages').is(':checked'),
+    import_database_connection_uri: $('#chatwootImportDatabaseUri').val().trim(),
+    import_database_ssl: $('#chatwootImportDatabaseSsl').is(':checked')
   };
-  
-  // Cache the API token in sessionStorage so it persists when reopening
-  if (apiTokenValue) {
-    sessionStorage.setItem('chatwoot_api_token', apiTokenValue);
-  }
   
   try {
     // Step 1: Save the configuration first
@@ -2213,5 +2194,44 @@ async function createChatwootInbox() {
   } catch (error) {
     showError('Error creating Chatwoot inbox: ' + error.message);
     console.error('Error:', error);
+  }
+}
+
+async function testChatwootImportDatabase() {
+  const token = getLocalStorageItem('token');
+  const connectionUri = $('#chatwootImportDatabaseUri').val().trim();
+  const useSSL = $('#chatwootImportDatabaseSsl').is(':checked');
+  
+  if (!connectionUri) {
+    showError('Please enter a PostgreSQL connection URI');
+    return;
+  }
+  
+  const myHeaders = new Headers();
+  myHeaders.append('token', token);
+  myHeaders.append('Content-Type', 'application/json');
+  
+  const testButton = $('#testChatwootImportDb');
+  const originalText = testButton.text();
+  testButton.prop('disabled', true).text('Testing...');
+  
+  try {
+    const res = await fetch(baseUrl + "/session/chatwoot/test-import-db", {
+      method: "POST",
+      headers: myHeaders,
+      body: JSON.stringify({ connection_uri: connectionUri, use_ssl: useSSL })
+    });
+    
+    const data = await res.json();
+    if (data.success) {
+      showSuccess('Connection successful!');
+    } else {
+      showError('Connection failed: ' + (data.error || 'Unknown error'));
+    }
+  } catch (error) {
+    showError('Error testing connection: ' + error.message);
+    console.error('Error:', error);
+  } finally {
+    testButton.prop('disabled', false).text(originalText);
   }
 }

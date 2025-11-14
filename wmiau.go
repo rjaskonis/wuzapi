@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-resty/resty/v2"
@@ -30,6 +31,7 @@ import (
 	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/store"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -45,6 +47,95 @@ type MyClient struct {
 	subscriptions  []string
 	db             *sqlx.DB
 	s              *server
+	// pushNameCache stores pushName by JID string to avoid repeated lookups
+	pushNameCache  map[string]string
+	pushNameMutex  sync.RWMutex
+}
+
+// historyLogMutex protects concurrent writes to history.log
+var historyLogMutex sync.Mutex
+
+// getPushNameWithCache retrieves pushName for a JID using in-memory cache to avoid repeated lookups
+// Returns empty string if pushName cannot be determined
+func (mycli *MyClient) getPushNameWithCache(ctx context.Context, jid types.JID, isFromMe bool, accountOwnerJID string) string {
+	if jid.User == "" {
+		return ""
+	}
+	
+	jidStr := jid.String()
+	
+	// Check cache first (read lock)
+	mycli.pushNameMutex.RLock()
+	if cached, found := mycli.pushNameCache[jidStr]; found {
+		mycli.pushNameMutex.RUnlock()
+		return cached
+	}
+	mycli.pushNameMutex.RUnlock()
+	
+	// Not in cache, need to look it up
+	var pushName string
+	
+	if mycli.WAClient != nil && mycli.WAClient.Store != nil {
+		if isFromMe {
+			// For messages from account owner, use the store's PushName
+			if mycli.WAClient.Store.PushName != "" {
+				pushName = mycli.WAClient.Store.PushName
+			} else {
+				// Fallback: try to get from contact store
+				if contact, err := mycli.WAClient.Store.Contacts.GetContact(ctx, jid); err == nil {
+					pushName = contact.PushName
+				}
+			}
+		} else {
+			// For incoming messages, get PushName from contact store
+			if contact, err := mycli.WAClient.Store.Contacts.GetContact(ctx, jid); err == nil {
+				pushName = contact.PushName
+			}
+		}
+	}
+	
+	// Store in cache (write lock)
+	mycli.pushNameMutex.Lock()
+	mycli.pushNameCache[jidStr] = pushName
+	mycli.pushNameMutex.Unlock()
+	
+	return pushName
+}
+
+// logRawHistoryMessage logs the raw HistorySync message to history.log file
+// This logs the raw message structure from WhatsApp before any processing
+func logRawHistoryMessage(userID string, msg *waHistorySync.HistorySyncMsg, convID string) {
+	historyLogMutex.Lock()
+	defer historyLogMutex.Unlock()
+
+	// Create a wrapper with metadata and the raw message
+	record := map[string]interface{}{
+		"user_id":        userID,
+		"conversation_id": convID,
+		"raw_message":    msg,
+	}
+
+	// Marshal to JSON
+	recordJSON, err := json.Marshal(record)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to marshal raw history message for logging")
+		return
+	}
+
+	// Open file in append mode
+	file, err := os.OpenFile("history.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to open history.log file")
+		return
+	}
+	defer file.Close()
+
+	// Write JSON record followed by newline
+	_, err = file.WriteString(string(recordJSON) + "\n")
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to write to history.log file")
+		return
+	}
 }
 
 func sendToGlobalWebHook(jsonData []byte, token string, userID string) {
@@ -408,7 +499,16 @@ func (s *server) startClient(userID string, textjid string, token string, subscr
 	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_UNKNOWN.Enum()
 	store.DeviceProps.Os = osName
 
-	mycli := MyClient{client, 1, userID, token, subscriptions, s.db, s}
+	mycli := MyClient{
+		WAClient:      client,
+		eventHandlerID: 1,
+		userID:        userID,
+		token:         token,
+		subscriptions: subscriptions,
+		db:            s.db,
+		s:             s,
+		pushNameCache: make(map[string]string),
+	}
 	mycli.eventHandlerID = mycli.WAClient.AddEventHandler(mycli.myEventHandler)
 
 	// Store the MyClient in clientManager
@@ -1609,6 +1709,139 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			}()
 		}
 
+		// Send to Chatwoot if configured (only for outgoing messages, not groups)
+		if evt.Info.IsFromMe && !evt.Info.IsGroup {
+			go func() {
+				// Get Chatwoot config
+				config, err := mycli.s.getChatwootConfig(txtid)
+				if err == nil && config != nil && config.BaseURL != "" && config.AccountID != "" && config.APIToken != "" && config.InboxID != "" {
+					// Extract message data
+					phone := ""
+					var lid, jid string
+					chatID := evt.Info.Chat.String()
+					if strings.HasSuffix(chatID, "@lid") {
+						lid = chatID
+					} else if strings.HasSuffix(chatID, "@s.whatsapp.net") {
+						jid = chatID
+						phone = strings.TrimSuffix(chatID, "@s.whatsapp.net")
+					} else {
+						phone = chatID
+					}
+					
+					// Normalize phone to E164 format if we have a phone number
+					if phone != "" {
+						// Get default country from environment or use BR as default
+						defaultCountry := os.Getenv("DEFAULT_COUNTRY")
+						if defaultCountry == "" {
+							defaultCountry = "BR"
+						}
+						phone = normalizeToE164(phone, defaultCountry)
+					}
+					
+					// Extract text content
+					content := ""
+					if conv := evt.Message.GetConversation(); conv != "" {
+						content = conv
+					} else if ext := evt.Message.GetExtendedTextMessage(); ext != nil {
+						content = ext.GetText()
+					}
+					
+					// Extract media data
+					var image, audio, document, video map[string]interface{}
+					
+					if img := evt.Message.GetImageMessage(); img != nil {
+						image = make(map[string]interface{})
+						if base64, ok := postmap["base64"].(string); ok {
+							image["base64"] = base64
+						}
+						if mimeType, ok := postmap["mimeType"].(string); ok {
+							image["mimeType"] = mimeType
+						}
+						if caption := img.GetCaption(); caption != "" {
+							image["caption"] = caption
+							if content == "" {
+								content = caption
+							}
+						}
+					}
+					
+					if aud := evt.Message.GetAudioMessage(); aud != nil {
+						audio = make(map[string]interface{})
+						if base64, ok := postmap["base64"].(string); ok {
+							audio["base64"] = base64
+						}
+						if mimeType, ok := postmap["mimeType"].(string); ok {
+							audio["mimeType"] = mimeType
+						}
+					}
+					
+					if doc := evt.Message.GetDocumentMessage(); doc != nil {
+						document = make(map[string]interface{})
+						if base64, ok := postmap["base64"].(string); ok {
+							document["base64"] = base64
+						}
+						if mimeType, ok := postmap["mimeType"].(string); ok {
+							document["mimeType"] = mimeType
+						}
+						if fileName, ok := postmap["fileName"].(string); ok {
+							document["fileName"] = fileName
+						}
+						if caption := doc.GetCaption(); caption != "" {
+							document["caption"] = caption
+							if content == "" {
+								content = caption
+							}
+						}
+					}
+					
+					if vid := evt.Message.GetVideoMessage(); vid != nil {
+						video = make(map[string]interface{})
+						if base64, ok := postmap["base64"].(string); ok {
+							video["base64"] = base64
+						}
+						if mimeType, ok := postmap["mimeType"].(string); ok {
+							video["mimeType"] = mimeType
+						}
+						if caption := vid.GetCaption(); caption != "" {
+							video["caption"] = caption
+							if content == "" {
+								content = caption
+							}
+						}
+					}
+					
+					// Process reply ID if available
+					var replyID *int
+					if ext := evt.Message.GetExtendedTextMessage(); ext != nil {
+						if ctxInfo := ext.GetContextInfo(); ctxInfo != nil {
+							// TODO: Map WhatsApp message ID to Chatwoot message ID for replies
+							// For now, we'll skip reply handling
+						}
+					}
+					
+					// Send to Chatwoot
+					err = mycli.s.ProcessOutgoingMessage(
+						txtid,
+						phone,
+						content,
+						lid,
+						jid,
+						image,
+						audio,
+						document,
+						video,
+						evt.Info.ID,
+						replyID,
+					)
+					if err != nil {
+						log.Warn().Err(err).Str("messageID", evt.Info.ID).Msg("Failed to send outgoing message to Chatwoot")
+					} else {
+						log.Info().Str("messageID", evt.Info.ID).Msg("Outgoing message sent to Chatwoot successfully")
+					}
+				}
+			}()
+		}
+
 	case *events.Receipt:
 		postmap["type"] = "ReadReceipt"
 		dowebhook = 1
@@ -1658,6 +1891,25 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					ignoreGroups = true
 				}
 				
+				// Get days_to_sync_history setting from database
+				var daysToSyncHistory int
+				err = mycli.db.Get(&daysToSyncHistory, "SELECT COALESCE(days_to_sync_history, 0) FROM users WHERE id=$1", mycli.userID)
+				if err != nil {
+					log.Warn().Err(err).Str("userID", mycli.userID).Msg("Failed to get days_to_sync_history setting, defaulting to 0")
+					daysToSyncHistory = 0
+				}
+				
+				// Calculate cutoff time for filtering messages by date
+				var cutoffTime time.Time
+				if daysToSyncHistory > 0 {
+					cutoffTime = time.Now().AddDate(0, 0, -daysToSyncHistory)
+					log.Info().
+						Str("userID", mycli.userID).
+						Int("days", daysToSyncHistory).
+						Time("cutoffTime", cutoffTime).
+						Msg("Filtering HistorySync messages by date")
+				}
+				
 				// Get the account owner's JID for messages sent by the instance
 				accountOwnerJID := ""
 				if mycli.WAClient.Store != nil && mycli.WAClient.Store.ID != nil {
@@ -1665,6 +1917,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				}
 				
 				savedCount := 0
+				skippedCount := 0
 				for _, conv := range evt.Data.Conversations {
 					if conv == nil || conv.ID == nil || conv.Messages == nil {
 						continue
@@ -1802,6 +2055,16 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 							msgTimestamp = time.Unix(int64(timestamp), 0)
 						}
 						
+						// Filter messages by date if days_to_sync_history is set
+						if daysToSyncHistory > 0 && msgTimestamp.Before(cutoffTime) {
+							skippedCount++
+							continue
+						}
+						
+						// Log the raw message to history.log before processing
+						// This logs only messages that pass the date filter (will be imported)
+						logRawHistoryMessage(mycli.userID, msg, *conv.ID)
+						
 						// Parse sender JID for MessageInfo
 						var senderJIDForInfo types.JID
 						if isFromMe {
@@ -1818,15 +2081,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 							}
 						}
 						
-						// Try to get PushName from store if available
-						pushName := ""
-						if !isFromMe && senderJIDForInfo.User != "" {
-							if mycli.WAClient != nil && mycli.WAClient.Store != nil {
-								if contact, err := mycli.WAClient.Store.Contacts.GetContact(context.Background(), senderJIDForInfo); err == nil {
-									pushName = contact.PushName
-								}
-							}
-						}
+						// Get PushName using cache to avoid repeated lookups
+						ctx := context.Background()
+						pushName := mycli.getPushNameWithCache(ctx, senderJIDForInfo, isFromMe, accountOwnerJID)
 						
 						// Create MessageInfo structure matching events.Message format
 						messageInfo := types.MessageInfo{
@@ -1898,10 +2155,12 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					}
 				}
 				
-				if savedCount > 0 {
+				if savedCount > 0 || skippedCount > 0 {
 					log.Info().
 						Str("userID", mycli.userID).
 						Int("savedCount", savedCount).
+						Int("skippedCount", skippedCount).
+						Int("daysToSyncHistory", daysToSyncHistory).
 						Msg("Saved HistorySync messages to message_history")
 				}
 			}()

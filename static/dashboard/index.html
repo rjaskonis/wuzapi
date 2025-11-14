@@ -597,7 +597,7 @@
         </div>
         <div class="field">
           <div class="ui checkbox">
-            <input type="checkbox" id="chatwootSignMsg" tabindex="0">
+            <input type="checkbox" id="chatwootSignMsg" tabindex="0" checked>
             <label>Sign messages with agent name</label>
           </div>
           <small>When enabled, messages sent from Chatwoot will be prefixed with the agent's name (e.g., "*Agent Name:*\nmessage").</small>
@@ -609,10 +609,32 @@
         </div>
         <div class="field">
           <div class="ui checkbox">
-            <input type="checkbox" id="chatwootMarkRead" tabindex="0">
+            <input type="checkbox" id="chatwootMarkRead" tabindex="0" checked>
             <label>Mark messages as read</label>
           </div>
           <small>When enabled, the last incoming message will be automatically marked as read after sending a message from Chatwoot to WhatsApp.</small>
+        </div>
+        <div class="field">
+          <div class="ui checkbox">
+            <input type="checkbox" id="chatwootImportMessages" tabindex="0">
+            <label>Import messages to Chatwoot</label>
+          </div>
+          <small>When enabled, incoming WhatsApp messages will be automatically imported to Chatwoot. When disabled, messages will not be sent to Chatwoot.</small>
+        </div>
+        <div class="field">
+          <label>PostgreSQL Connection URI (for Import)</label>
+          <div class="ui action input">
+            <input id="chatwootImportDatabaseUri" type="text" placeholder="postgresql://user:password@host:port/database">
+            <button class="ui button" id="testChatwootImportDb" type="button">Test Connection</button>
+          </div>
+          <small>PostgreSQL connection URI to Chatwoot's database for importing chat history. Leave empty to skip import.</small>
+        </div>
+        <div class="field">
+          <div class="ui checkbox">
+            <input type="checkbox" id="chatwootImportDatabaseSsl" tabindex="0">
+            <label>Enable SSL for database connection</label>
+          </div>
+          <small>Enable SSL for the PostgreSQL connection. Default: disabled (sslmode=disable).</small>
         </div>
       </div>
     </div>

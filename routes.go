@@ -102,6 +102,7 @@ func (s *server) routes() {
 	s.router.Handle("/session/chatwoot/config", c.Then(s.ConfigureChatwoot())).Methods("POST")
 	s.router.Handle("/session/chatwoot/config", c.Then(s.GetChatwootConfig())).Methods("GET")
 	s.router.Handle("/session/chatwoot/inbox/create", c.Then(s.CreateChatwootInbox())).Methods("POST")
+	s.router.Handle("/session/chatwoot/test-import-db", c.Then(s.TestChatwootImportDatabase())).Methods("POST")
 	
 	// Webhook route for Chatwoot (no auth required, but userID in path)
 	s.router.Handle("/webhook/chatwoot/{userID}", s.ChatwootWebhookCallback()).Methods("POST")

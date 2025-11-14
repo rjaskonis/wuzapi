@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -68,43 +69,68 @@ func getDatabaseConfig(exPath string) DatabaseConfig {
 }
 
 func initializePostgres(config DatabaseConfig) (*sqlx.DB, error) {
-	dsn := fmt.Sprintf(
+	// First, open a temporary connection without search_path to create schema if needed
+	tempDSN := fmt.Sprintf(
 		"user=%s password=%s dbname=%s host=%s port=%s sslmode=%s",
 		config.User, config.Password, config.Name, config.Host, config.Port, config.SSLMode,
 	)
 
-	// Open connection without search_path first to ensure schema exists
+	tempDB, err := sqlx.Open("postgres", tempDSN)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open temporary postgres connection: %w", err)
+	}
+	defer tempDB.Close()
+
+	if err := tempDB.Ping(); err != nil {
+		return nil, fmt.Errorf("failed to ping postgres database: %w", err)
+	}
+
+	// Create schema if specified and doesn't exist
+	var quotedSchema string
+	if config.Schema != "" {
+		// Use PostgreSQL's quote_ident function to safely quote the schema identifier
+		err = tempDB.Get(&quotedSchema, `SELECT quote_ident($1::text)`, config.Schema)
+		if err != nil {
+			return nil, fmt.Errorf("failed to quote schema name: %w", err)
+		}
+		_, err = tempDB.Exec(`CREATE SCHEMA IF NOT EXISTS ` + quotedSchema)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create schema %s: %w", config.Schema, err)
+		}
+	}
+
+	// Now build the final DSN with search_path in connection string
+	// This ensures all connections from the pool use the correct schema
+	dsn := fmt.Sprintf(
+		"user=%s password=%s dbname=%s host=%s port=%s sslmode=%s",
+		config.User, config.Password, config.Name, config.Host, config.Port, config.SSLMode,
+	)
+	if config.Schema != "" {
+		// Add search_path via options parameter so all pooled connections use it
+		// lib/pq supports setting runtime parameters via options=-cparam=value
+		// We need to properly escape the schema name if it contains special characters
+		// Since quotedSchema is already properly quoted by quote_ident, we can use it directly
+		// But we need to remove the quotes for the options parameter
+		schemaForOptions := strings.Trim(quotedSchema, `"`)
+		dsn += fmt.Sprintf(" options=-csearch_path=%s", schemaForOptions)
+	}
+
+	// Open the actual database connection with search_path in connection string
 	db, err := sqlx.Open("postgres", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open postgres connection: %w", err)
 	}
 
 	if err := db.Ping(); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("failed to ping postgres database: %w", err)
 	}
 
-	// Create schema if specified and doesn't exist
-	if config.Schema != "" {
-		// Use PostgreSQL's quote_ident function to safely quote the schema identifier
-		// Cast to text explicitly to help PostgreSQL determine the parameter type
-		var quotedSchema string
-		err = db.Get(&quotedSchema, `SELECT quote_ident($1::text)`, config.Schema)
-		if err != nil {
-			db.Close()
-			return nil, fmt.Errorf("failed to quote schema name: %w", err)
-		}
-		_, err = db.Exec(`CREATE SCHEMA IF NOT EXISTS ` + quotedSchema)
-		if err != nil {
-			db.Close()
-			return nil, fmt.Errorf("failed to create schema %s: %w", config.Schema, err)
-		}
-		// Set search_path for this connection
-		_, err = db.Exec(`SET search_path TO ` + quotedSchema)
-		if err != nil {
-			db.Close()
-			return nil, fmt.Errorf("failed to set search_path to %s: %w", config.Schema, err)
-		}
-	}
+	// Configure connection pool to prevent stale connections
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetConnMaxIdleTime(2 * time.Minute)
 
 	return db, nil
 }
@@ -123,6 +149,12 @@ func initializeSQLite(config DatabaseConfig) (*sqlx.DB, error) {
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("failed to ping sqlite database: %w", err)
 	}
+
+	// Configure connection pool to prevent stale connections
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetConnMaxIdleTime(2 * time.Minute)
 
 	return db, nil
 }
@@ -210,4 +242,55 @@ func (s *server) trimMessageHistory(userID, chatJID string, limit int) error {
 	}
 
 	return nil
+}
+
+// ensureDBConnection checks if the database connection is healthy and attempts to reconnect if needed
+func (s *server) ensureDBConnection() error {
+	if err := s.db.Ping(); err != nil {
+		// Connection is stale, try to reconnect
+		// For sqlx.DB, Ping() will automatically try to get a new connection from the pool
+		// If that fails, we need to check if it's a temporary issue
+		if strings.Contains(err.Error(), "connection") || strings.Contains(err.Error(), "closed") {
+			// Try pinging again after a short delay
+			time.Sleep(100 * time.Millisecond)
+			if err := s.db.Ping(); err != nil {
+				return fmt.Errorf("database connection is unhealthy: %w", err)
+			}
+		} else {
+			return fmt.Errorf("database ping failed: %w", err)
+		}
+	}
+	return nil
+}
+
+// checkColumnExists checks if a column exists in a table
+func (s *server) checkColumnExists(tableName, columnName string) (bool, error) {
+	var exists bool
+	var err error
+
+	switch s.db.DriverName() {
+	case "postgres":
+		err = s.db.Get(&exists, `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns 
+				WHERE table_schema = current_schema()
+				AND table_name = $1 AND column_name = $2
+			)`, tableName, columnName)
+	case "sqlite":
+		var count int
+		err = s.db.Get(&count, `
+			SELECT COUNT(*) FROM pragma_table_info(?)
+			WHERE name = ?`, tableName, columnName)
+		if err == nil {
+			exists = count > 0
+		}
+	default:
+		return false, fmt.Errorf("unsupported database driver: %s", s.db.DriverName())
+	}
+
+	if err != nil {
+		return false, fmt.Errorf("failed to check column existence: %w", err)
+	}
+
+	return exists, nil
 }

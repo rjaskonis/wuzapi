@@ -2,21 +2,27 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-resty/resty/v2"
 	"github.com/rs/zerolog/log"
+	_ "github.com/lib/pq"
 )
 
 // normalizeToE164 normalizes a phone number to E164 format
@@ -86,14 +92,17 @@ func normalizeToE164(phone string, defaultCountry string) string {
 
 // ChatwootConfig represents the Chatwoot configuration for a user
 type ChatwootConfig struct {
-	BaseURL       string `db:"chatwoot_base_url"`
-	AccountID     string `db:"chatwoot_account_id"`
-	APIToken      string `db:"chatwoot_api_token"`
-	InboxName     string `db:"chatwoot_inbox_name"`
-	InboxID       string `db:"chatwoot_inbox_id"`
-	SignMsg       bool   `db:"chatwoot_sign_msg"`
-	SignDelimiter string `db:"chatwoot_sign_delimiter"`
-	MarkRead      bool   `db:"chatwoot_mark_read"`
+	BaseURL                     string `db:"chatwoot_base_url"`
+	AccountID                   string `db:"chatwoot_account_id"`
+	APIToken                    string `db:"chatwoot_api_token"`
+	InboxName                   string `db:"chatwoot_inbox_name"`
+	InboxID                     string `db:"chatwoot_inbox_id"`
+	SignMsg                     bool   `db:"chatwoot_sign_msg"`
+	SignDelimiter               string `db:"chatwoot_sign_delimiter"`
+	MarkRead                    bool   `db:"chatwoot_mark_read"`
+	ImportMessages              bool   `db:"chatwoot_import_messages"`
+	ImportDatabaseConnectionURI  string `db:"chatwoot_import_database_connection_uri"`
+	ImportDatabaseSSL           bool   `db:"chatwoot_import_database_ssl"`
 }
 
 // getChatwootConfig retrieves Chatwoot configuration from database
@@ -110,7 +119,10 @@ func (s *server) getChatwootConfig(userID string) (*ChatwootConfig, error) {
 			chatwoot_inbox_id,
 			COALESCE(chatwoot_sign_msg, false) as chatwoot_sign_msg,
 			COALESCE(chatwoot_sign_delimiter, '\n') as chatwoot_sign_delimiter,
-			COALESCE(chatwoot_mark_read, false) as chatwoot_mark_read
+			COALESCE(chatwoot_mark_read, false) as chatwoot_mark_read,
+			COALESCE(chatwoot_import_messages, true) as chatwoot_import_messages,
+			COALESCE(chatwoot_import_database_connection_uri, '') as chatwoot_import_database_connection_uri,
+			COALESCE(chatwoot_import_database_ssl, false) as chatwoot_import_database_ssl
 		FROM users WHERE id = $1`
 	
 	if s.db.DriverName() == "sqlite" {
@@ -128,7 +140,9 @@ func (s *server) getChatwootConfig(userID string) (*ChatwootConfig, error) {
 				chatwoot_inbox_name,
 				chatwoot_inbox_id,
 				COALESCE(chatwoot_sign_msg, false) as chatwoot_sign_msg,
-				COALESCE(chatwoot_sign_delimiter, '\n') as chatwoot_sign_delimiter
+				COALESCE(chatwoot_sign_delimiter, '\n') as chatwoot_sign_delimiter,
+				COALESCE(chatwoot_import_database_connection_uri, '') as chatwoot_import_database_connection_uri,
+				COALESCE(chatwoot_import_database_ssl, false) as chatwoot_import_database_ssl
 			FROM users WHERE id = $1`
 		
 		if s.db.DriverName() == "sqlite" {
@@ -144,7 +158,9 @@ func (s *server) getChatwootConfig(userID string) (*ChatwootConfig, error) {
 					chatwoot_account_id,
 					chatwoot_api_token,
 					chatwoot_inbox_name,
-					chatwoot_inbox_id
+					chatwoot_inbox_id,
+					COALESCE(chatwoot_import_database_connection_uri, '') as chatwoot_import_database_connection_uri,
+					COALESCE(chatwoot_import_database_ssl, false) as chatwoot_import_database_ssl
 				FROM users WHERE id = $1`
 			
 			if s.db.DriverName() == "sqlite" {
@@ -159,13 +175,53 @@ func (s *server) getChatwootConfig(userID string) (*ChatwootConfig, error) {
 			config.SignMsg = false
 			config.SignDelimiter = "\n"
 			config.MarkRead = false
+			config.ImportMessages = true // Default to enabled for backward compatibility
+			config.ImportDatabaseConnectionURI = ""
+			config.ImportDatabaseSSL = false
 		} else {
 			// Set default for mark_read if column doesn't exist
 			config.MarkRead = false
+			config.ImportMessages = true // Default to enabled for backward compatibility
+			config.ImportDatabaseConnectionURI = ""
+			config.ImportDatabaseSSL = false
 		}
 	}
 	
 	return &config, nil
+}
+
+// buildDatabaseConnectionURI builds a PostgreSQL connection URI with SSL mode
+func buildDatabaseConnectionURI(baseURI string, useSSL bool) string {
+	if baseURI == "" {
+		return ""
+	}
+	
+	// Parse the URI to add/modify sslmode parameter
+	parsedURI, err := url.Parse(baseURI)
+	if err != nil {
+		// If parsing fails, just append sslmode to the end
+		if useSSL {
+			return baseURI
+		}
+		if strings.Contains(baseURI, "?") {
+			return baseURI + "&sslmode=disable"
+		}
+		return baseURI + "?sslmode=disable"
+	}
+	
+	// Get existing query parameters
+	query := parsedURI.Query()
+	
+	// Set sslmode based on useSSL flag
+	if useSSL {
+		query.Set("sslmode", "require")
+	} else {
+		query.Set("sslmode", "disable")
+	}
+	
+	// Rebuild the URI
+	parsedURI.RawQuery = query.Encode()
+	return parsedURI.String()
 }
 
 // updateChatwootInboxID updates the inbox ID in the database
@@ -671,10 +727,11 @@ func findOrCreateConversation(client *resty.Client, accountID, inboxID string, c
 }
 
 // sendTextMessage sends a text message to Chatwoot
-func sendTextMessage(client *resty.Client, accountID string, conversationID int, content string, messageType string, replyID *int) error {
+func sendTextMessage(client *resty.Client, accountID string, conversationID int, content string, messageType string, replyID *int, sourceID string) error {
 	type MessageRequest struct {
 		Content     string                 `json:"content"`
 		MessageType string                 `json:"message_type"`
+		SourceID    string                 `json:"source_id,omitempty"`
 		ContentAttributes map[string]interface{} `json:"content_attributes,omitempty"`
 	}
 	
@@ -683,11 +740,16 @@ func sendTextMessage(client *resty.Client, accountID string, conversationID int,
 		MessageType: messageType,
 	}
 	
+	if sourceID != "" {
+		request.SourceID = sourceID
+	}
+	
 	if replyID != nil {
-		request.ContentAttributes = map[string]interface{}{
-			"in_reply_to":            *replyID,
-			"in_reply_to_external_id": nil,
+		if request.ContentAttributes == nil {
+			request.ContentAttributes = make(map[string]interface{})
 		}
+		request.ContentAttributes["in_reply_to"] = *replyID
+		request.ContentAttributes["in_reply_to_external_id"] = nil
 	}
 	
 	resp, err := client.R().
@@ -706,7 +768,7 @@ func sendTextMessage(client *resty.Client, accountID string, conversationID int,
 }
 
 // sendMessageWithAttachment sends a message with an attachment to Chatwoot
-func sendMessageWithAttachment(client *resty.Client, accountID string, conversationID int, content string, messageType string, attachmentData []byte, filename, contentType string, replyID *int) error {
+func sendMessageWithAttachment(client *resty.Client, accountID string, conversationID int, content string, messageType string, attachmentData []byte, filename, contentType string, replyID *int, sourceID string) error {
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	
@@ -716,6 +778,10 @@ func sendMessageWithAttachment(client *resty.Client, accountID string, conversat
 		writer.WriteField("content", content)
 	}
 	writer.WriteField("message_type", messageType)
+	
+	if sourceID != "" {
+		writer.WriteField("source_id", sourceID)
+	}
 	
 	if replyID != nil {
 		replyIDStr := fmt.Sprintf("%d", *replyID)
@@ -861,6 +927,12 @@ func (s *server) ProcessIncomingMessage(userID string, phone, content, senderPho
 		return fmt.Errorf("failed to find or create conversation: %w", err)
 	}
 	
+	// Generate source_id to identify messages that originated from WhatsApp
+	sourceID := ""
+	if messageID != "" {
+		sourceID = fmt.Sprintf("WAID:%s", messageID)
+	}
+	
 	// Send message based on type
 	if video != nil {
 		// Send video
@@ -876,10 +948,10 @@ func (s *server) ProcessIncomingMessage(userID string, phone, content, senderPho
 				content = caption
 			}
 			filename := fmt.Sprintf("video_%d.mp4", time.Now().Unix())
-			err = sendMessageWithAttachment(client, config.AccountID, conversation.ID, content, "incoming", videoData, filename, mimeType, replyID)
+			err = sendMessageWithAttachment(client, config.AccountID, conversation.ID, content, "incoming", videoData, filename, mimeType, replyID, sourceID)
 			if err != nil {
 				log.Warn().Err(err).Msg("Failed to send video, falling back to text")
-				return sendTextMessage(client, config.AccountID, conversation.ID, content+" [Video]", "incoming", replyID)
+				return sendTextMessage(client, config.AccountID, conversation.ID, content+" [Video]", "incoming", replyID, sourceID)
 			}
 			return nil
 		}
@@ -900,10 +972,10 @@ func (s *server) ProcessIncomingMessage(userID string, phone, content, senderPho
 			if content == "" {
 				content = caption
 			}
-			err = sendMessageWithAttachment(client, config.AccountID, conversation.ID, content, "incoming", docData, fileName, mimeType, replyID)
+			err = sendMessageWithAttachment(client, config.AccountID, conversation.ID, content, "incoming", docData, fileName, mimeType, replyID, sourceID)
 			if err != nil {
 				log.Warn().Err(err).Msg("Failed to send document, falling back to text")
-				return sendTextMessage(client, config.AccountID, conversation.ID, content+" [Document]", "incoming", replyID)
+				return sendTextMessage(client, config.AccountID, conversation.ID, content+" [Document]", "incoming", replyID, sourceID)
 			}
 			return nil
 		}
@@ -939,7 +1011,7 @@ func (s *server) ProcessIncomingMessage(userID string, phone, content, senderPho
 			filename := fmt.Sprintf("audio.%s", ext)
 			// Send audio without text content - Chatwoot will display the audio player
 			// Pass empty string for content - Chatwoot will show only the audio player
-			err = sendMessageWithAttachment(client, config.AccountID, conversation.ID, "", "incoming", audioData, filename, mimeType, replyID)
+			err = sendMessageWithAttachment(client, config.AccountID, conversation.ID, "", "incoming", audioData, filename, mimeType, replyID, sourceID)
 			if err != nil {
 				log.Warn().Err(err).Msg("Failed to send audio")
 				// Don't fallback to text for audio - if audio fails, just return the error
@@ -969,16 +1041,599 @@ func (s *server) ProcessIncomingMessage(userID string, phone, content, senderPho
 				ext = "webp"
 			}
 			filename := fmt.Sprintf("image.%s", ext)
-			err = sendMessageWithAttachment(client, config.AccountID, conversation.ID, content, "incoming", imageData, filename, mimeType, replyID)
+			err = sendMessageWithAttachment(client, config.AccountID, conversation.ID, content, "incoming", imageData, filename, mimeType, replyID, sourceID)
 			if err != nil {
 				log.Warn().Err(err).Msg("Failed to send image, falling back to text")
-				return sendTextMessage(client, config.AccountID, conversation.ID, content+" [Image]", "incoming", replyID)
+				return sendTextMessage(client, config.AccountID, conversation.ID, content+" [Image]", "incoming", replyID, sourceID)
 			}
 			return nil
 		}
 	}
 	
 	// Send text message
-	return sendTextMessage(client, config.AccountID, conversation.ID, content, "incoming", replyID)
+	return sendTextMessage(client, config.AccountID, conversation.ID, content, "incoming", replyID, sourceID)
+}
+
+// ProcessOutgoingMessage processes an outgoing WhatsApp message and sends it to Chatwoot
+func (s *server) ProcessOutgoingMessage(userID string, phone, content string, lid, jid string, image, audio, document, video map[string]interface{}, messageID string, replyID *int) error {
+	config, err := s.getChatwootConfig(userID)
+	if err != nil {
+		return fmt.Errorf("failed to get Chatwoot config: %w", err)
+	}
+	
+	if config.BaseURL == "" || config.AccountID == "" || config.APIToken == "" {
+		return fmt.Errorf("Chatwoot not configured")
+	}
+	
+	if config.InboxID == "" {
+		return fmt.Errorf("Chatwoot inbox not created. Please create inbox first")
+	}
+	
+	client := getChatwootClient(config.BaseURL, config.APIToken)
+	
+	// Determine identifier (LID > JID > phone)
+	identifier := lid
+	if identifier == "" {
+		identifier = jid
+	}
+	if identifier == "" {
+		identifier = phone
+	}
+	
+	if identifier == "" {
+		return fmt.Errorf("no valid identifier (phone, lid, or jid)")
+	}
+	
+	// Find or create contact
+	contact, err := findOrCreateContact(client, config.AccountID, "", identifier, phone, "")
+	if err != nil {
+		return fmt.Errorf("failed to find or create contact: %w", err)
+	}
+	
+	// Find or create conversation
+	conversation, err := findOrCreateConversation(client, config.AccountID, config.InboxID, contact.ID, true)
+	if err != nil {
+		return fmt.Errorf("failed to find or create conversation: %w", err)
+	}
+	
+	// Generate source_id to identify messages that originated from WhatsApp
+	sourceID := ""
+	if messageID != "" {
+		sourceID = fmt.Sprintf("WAID:%s", messageID)
+	}
+	
+	// Send message based on type
+	if video != nil {
+		// Send video
+		videoBase64, _ := video["base64"].(string)
+		videoData, err := downloadMediaFromBase64(videoBase64)
+		if err == nil {
+			mimeType, _ := video["mimeType"].(string)
+			if mimeType == "" {
+				mimeType = "video/mp4"
+			}
+			caption, _ := video["caption"].(string)
+			if content == "" {
+				content = caption
+			}
+			filename := fmt.Sprintf("video_%d.mp4", time.Now().Unix())
+			err = sendMessageWithAttachment(client, config.AccountID, conversation.ID, content, "outgoing", videoData, filename, mimeType, replyID, sourceID)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to send video, falling back to text")
+				return sendTextMessage(client, config.AccountID, conversation.ID, content+" [Video]", "outgoing", replyID, sourceID)
+			}
+			return nil
+		}
+	} else if document != nil {
+		// Send document
+		docBase64, _ := document["base64"].(string)
+		docData, err := downloadMediaFromBase64(docBase64)
+		if err == nil {
+			mimeType, _ := document["mimeType"].(string)
+			if mimeType == "" {
+				mimeType = "application/octet-stream"
+			}
+			fileName, _ := document["fileName"].(string)
+			if fileName == "" {
+				fileName = "document"
+			}
+			caption, _ := document["caption"].(string)
+			if content == "" {
+				content = caption
+			}
+			err = sendMessageWithAttachment(client, config.AccountID, conversation.ID, content, "outgoing", docData, fileName, mimeType, replyID, sourceID)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to send document, falling back to text")
+				return sendTextMessage(client, config.AccountID, conversation.ID, content+" [Document]", "outgoing", replyID, sourceID)
+			}
+			return nil
+		}
+	} else if audio != nil {
+		// Send audio
+		audioBase64, _ := audio["base64"].(string)
+		audioData, err := downloadMediaFromBase64(audioBase64)
+		if err == nil {
+			mimeType, _ := audio["mimeType"].(string)
+			// Clean mimeType - remove any parameters
+			if mimeType != "" {
+				parts := strings.Split(mimeType, ";")
+				mimeType = strings.TrimSpace(parts[0])
+			}
+			if mimeType == "" {
+				mimeType = "audio/ogg"
+			}
+			// Extract extension from mimeType
+			ext := "ogg"
+			if strings.Contains(mimeType, "mp3") || strings.Contains(mimeType, "mpeg") {
+				ext = "mp3"
+				mimeType = "audio/mpeg"
+			} else if strings.Contains(mimeType, "m4a") || strings.Contains(mimeType, "mp4a") {
+				ext = "m4a"
+				mimeType = "audio/mp4"
+			} else if strings.Contains(mimeType, "ogg") {
+				ext = "ogg"
+				mimeType = "audio/ogg"
+			} else if strings.Contains(mimeType, "wav") {
+				ext = "wav"
+				mimeType = "audio/wav"
+			}
+			filename := fmt.Sprintf("audio.%s", ext)
+			err = sendMessageWithAttachment(client, config.AccountID, conversation.ID, "", "outgoing", audioData, filename, mimeType, replyID, sourceID)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to send audio")
+				return err
+			}
+			return nil
+		}
+	} else if image != nil {
+		// Send image
+		imageBase64, _ := image["base64"].(string)
+		imageData, err := downloadMediaFromBase64(imageBase64)
+		if err == nil {
+			mimeType, _ := image["mimeType"].(string)
+			if mimeType == "" {
+				mimeType = "image/jpeg"
+			}
+			caption, _ := image["caption"].(string)
+			if content == "" {
+				content = caption
+			}
+			ext := "jpg"
+			if strings.Contains(mimeType, "png") {
+				ext = "png"
+			} else if strings.Contains(mimeType, "gif") {
+				ext = "gif"
+			} else if strings.Contains(mimeType, "webp") {
+				ext = "webp"
+			}
+			filename := fmt.Sprintf("image.%s", ext)
+			err = sendMessageWithAttachment(client, config.AccountID, conversation.ID, content, "outgoing", imageData, filename, mimeType, replyID, sourceID)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to send image, falling back to text")
+				return sendTextMessage(client, config.AccountID, conversation.ID, content+" [Image]", "outgoing", replyID, sourceID)
+			}
+			return nil
+		}
+	}
+	
+	// Send text message
+	return sendTextMessage(client, config.AccountID, conversation.ID, content, "outgoing", replyID, sourceID)
+}
+
+// ChatwootUser represents a Chatwoot user from access_tokens table
+type ChatwootUser struct {
+	UserType string
+	UserID   int
+}
+
+// getChatwootUser retrieves the Chatwoot user from access_tokens table
+func getChatwootUser(chatwootDB *sql.DB, apiToken string) (*ChatwootUser, error) {
+	var user ChatwootUser
+	err := chatwootDB.QueryRow(`
+		SELECT owner_type AS user_type, owner_id AS user_id
+		FROM access_tokens
+		WHERE token = $1`, apiToken).Scan(&user.UserType, &user.UserID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get Chatwoot user: %w", err)
+	}
+	return &user, nil
+}
+
+// updateContactName updates a contact's name in Chatwoot database if pushName is found
+// It updates the name if it's currently empty, null, or matches the phone number
+func updateContactName(chatwootDB *sql.DB, accountID int, contactID int, pushName string) error {
+	if pushName == "" {
+		return nil
+	}
+	_, err := chatwootDB.Exec(`
+		UPDATE contacts 
+		SET name = $1, updated_at = NOW()
+		WHERE id = $2 AND account_id = $3 AND (name IS NULL OR name = '' OR name = phone_number OR name = REPLACE(phone_number, '+', ''))`,
+		pushName, contactID, accountID)
+	return err
+}
+
+// ImportChatHistory imports chat history from message_history table to Chatwoot
+func (s *server) ImportChatHistory(userID string, config *ChatwootConfig) error {
+	// Check if message import is enabled
+	if !config.ImportMessages {
+		log.Info().Str("userID", userID).Msg("Message import is disabled, skipping import")
+		return nil
+	}
+
+	if config.ImportDatabaseConnectionURI == "" {
+		log.Info().Str("userID", userID).Msg("Import database URI not configured, skipping import")
+		return nil
+	}
+
+	if config.InboxID == "" {
+		log.Warn().Str("userID", userID).Msg("Inbox ID not set, cannot import history")
+		return fmt.Errorf("inbox ID not set")
+	}
+
+	// Connect to Chatwoot's database with SSL setting
+	connectionURI := buildDatabaseConnectionURI(config.ImportDatabaseConnectionURI, config.ImportDatabaseSSL)
+	chatwootDB, err := sql.Open("postgres", connectionURI)
+	if err != nil {
+		return fmt.Errorf("failed to connect to Chatwoot database: %w", err)
+	}
+	defer chatwootDB.Close()
+
+	// Verify connection
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	if err := chatwootDB.PingContext(ctx); err != nil {
+		return fmt.Errorf("failed to ping Chatwoot database: %w", err)
+	}
+
+	// Get Chatwoot user from access_tokens table
+	chatwootUser, err := getChatwootUser(chatwootDB, config.APIToken)
+	if err != nil {
+		return fmt.Errorf("failed to get Chatwoot user: %w", err)
+	}
+
+	// Get Chatwoot API client (for creating contacts/conversations)
+	client := getChatwootClient(config.BaseURL, config.APIToken)
+	accountIDInt, err := strconv.Atoi(config.AccountID)
+	if err != nil {
+		return fmt.Errorf("invalid account ID: %w", err)
+	}
+	inboxIDInt, err := strconv.Atoi(config.InboxID)
+	if err != nil {
+		return fmt.Errorf("invalid inbox ID: %w", err)
+	}
+
+	// Get all messages from message_history for this user
+	var messages []HistoryMessage
+	query := `
+		SELECT id, user_id, chat_jid, sender_jid, message_id, timestamp, message_type, 
+		       text_content, media_link, COALESCE(quoted_message_id, '') as quoted_message_id, 
+		       COALESCE(datajson, '') as datajson
+		FROM message_history
+		WHERE user_id = $1
+		ORDER BY timestamp ASC`
+	if s.db.DriverName() == "sqlite" {
+		query = strings.ReplaceAll(query, "$1", "?")
+	}
+
+	err = s.db.Select(&messages, query, userID)
+	if err != nil {
+		return fmt.Errorf("failed to get messages from history: %w", err)
+	}
+
+	if len(messages) == 0 {
+		log.Info().Str("userID", userID).Msg("No messages found in history to import")
+		return nil
+	}
+
+	log.Info().Str("userID", userID).Int("message_count", len(messages)).Msg("Starting chat history import")
+
+	// Group messages by chat_jid to create contacts and conversations
+	chatMap := make(map[string][]HistoryMessage)
+	for _, msg := range messages {
+		chatMap[msg.ChatJID] = append(chatMap[msg.ChatJID], msg)
+	}
+
+	importedCount := 0
+	errorCount := 0
+
+	// Process each chat
+	for chatJID, chatMessages := range chatMap {
+		// Skip group chats (they end with @g.us)
+		if strings.HasSuffix(chatJID, "@g.us") {
+			log.Debug().Str("chatJID", chatJID).Msg("Skipping group chat")
+			continue
+		}
+
+		// Extract phone number from chat JID
+		phoneNumber := strings.Split(chatJID, "@")[0]
+		if phoneNumber == "" {
+			continue
+		}
+
+		// Check all messages for pushName (not just the first one)
+		// pushName is in Info.PushName in the datajson structure
+		// We only extract pushName from messages sent by the contact (IsFromMe = false)
+		contactName := phoneNumber
+		var bestPushName string
+		for _, msg := range chatMessages {
+			if msg.DataJson != "" {
+				var data map[string]interface{}
+				if err := json.Unmarshal([]byte(msg.DataJson), &data); err == nil {
+					if info, ok := data["Info"].(map[string]interface{}); ok {
+						// Check Info.IsFromMe to determine if message is from contact (not from instance)
+						var isFromMe bool
+						if isFromMeVal, ok := info["IsFromMe"].(bool); ok {
+							isFromMe = isFromMeVal
+						}
+						// Extract pushName from Info.PushName only for incoming messages
+						if !isFromMe {
+							if pushName, ok := info["PushName"].(string); ok && pushName != "" && pushName != phoneNumber {
+								bestPushName = pushName
+								contactName = pushName
+								// Continue checking other messages to find the best pushName
+								// (in case there are multiple, we'll use the last non-empty one)
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Create or find contact
+		contact, err := findOrCreateContact(client, config.AccountID, contactName, chatJID, phoneNumber, "")
+		if err != nil {
+			log.Warn().Err(err).Str("chatJID", chatJID).Msg("Failed to create/find contact")
+			errorCount++
+			continue
+		}
+
+		// Update contact name with pushName if found and contact name is still phone number
+		if bestPushName != "" {
+			err = updateContactName(chatwootDB, accountIDInt, contact.ID, bestPushName)
+			if err != nil {
+				log.Warn().Err(err).Int("contact_id", contact.ID).Str("pushName", bestPushName).Msg("Failed to update contact name")
+			}
+		}
+
+		// Get or create contact_inbox
+		var contactInboxID int
+		err = chatwootDB.QueryRow(`
+			SELECT id FROM contact_inboxes 
+			WHERE contact_id = $1 AND inbox_id = $2`,
+			contact.ID, inboxIDInt).Scan(&contactInboxID)
+		if err == sql.ErrNoRows {
+			// Create contact_inbox
+			err = chatwootDB.QueryRow(`
+				INSERT INTO contact_inboxes (contact_id, inbox_id, source_id, created_at, updated_at)
+				VALUES ($1, $2, gen_random_uuid(), NOW(), NOW())
+				RETURNING id`,
+				contact.ID, inboxIDInt).Scan(&contactInboxID)
+			if err != nil {
+				log.Warn().Err(err).Str("chatJID", chatJID).Msg("Failed to create contact_inbox")
+				errorCount++
+				continue
+			}
+		} else if err != nil {
+			log.Warn().Err(err).Str("chatJID", chatJID).Msg("Failed to get contact_inbox")
+			errorCount++
+			continue
+		}
+
+		// Get or create conversation
+		var conversationID int
+		err = chatwootDB.QueryRow(`
+			SELECT id FROM conversations 
+			WHERE account_id = $1 AND inbox_id = $2 AND contact_id = $3 AND contact_inbox_id = $4`,
+			accountIDInt, inboxIDInt, contact.ID, contactInboxID).Scan(&conversationID)
+		if err == sql.ErrNoRows {
+			// Create conversation
+			err = chatwootDB.QueryRow(`
+				INSERT INTO conversations (account_id, inbox_id, status, contact_id, contact_inbox_id, uuid, last_activity_at, created_at, updated_at)
+				VALUES ($1, $2, 0, $3, $4, gen_random_uuid(), NOW(), NOW(), NOW())
+				RETURNING id`,
+				accountIDInt, inboxIDInt, contact.ID, contactInboxID).Scan(&conversationID)
+			if err != nil {
+				log.Warn().Err(err).Str("chatJID", chatJID).Msg("Failed to create conversation")
+				errorCount++
+				continue
+			}
+		} else if err != nil {
+			log.Warn().Err(err).Str("chatJID", chatJID).Msg("Failed to get conversation")
+			errorCount++
+			continue
+		}
+
+		// Check which messages are already imported by querying Chatwoot's database
+		existingSourceIDs := make(map[string]bool)
+		rows, err := chatwootDB.QueryContext(ctx, `
+			SELECT source_id 
+			FROM messages 
+			WHERE inbox_id = $1 AND conversation_id = $2 AND source_id IS NOT NULL`,
+			inboxIDInt, conversationID)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var sourceID string
+				if err := rows.Scan(&sourceID); err == nil {
+					existingSourceIDs[sourceID] = true
+				}
+			}
+		}
+
+		// Prepare batch insert for messages
+		var messagesToInsert []struct {
+			content      string
+			messageType  string
+			senderType   string
+			senderID     int
+			sourceID     string
+			timestamp    time.Time
+			inReplyTo    *int
+		}
+
+		// Collect messages to import
+		for _, msg := range chatMessages {
+			// Skip if already imported
+			sourceID := fmt.Sprintf("WAID:%s", msg.MessageID)
+			if existingSourceIDs[sourceID] {
+				continue
+			}
+
+			// Determine message type (0 = incoming, 1 = outgoing)
+			// Check Info.IsFromMe in datajson to determine if message is from instance
+			// Also check sender_jid == "me" as fallback for messages sent via API
+			isFromMe := false
+			if msg.DataJson != "" {
+				var data map[string]interface{}
+				if err := json.Unmarshal([]byte(msg.DataJson), &data); err == nil {
+					if info, ok := data["Info"].(map[string]interface{}); ok {
+						if isFromMeVal, ok := info["IsFromMe"].(bool); ok {
+							isFromMe = isFromMeVal
+						}
+					}
+					// Also check RawMessage.key.fromMe as fallback
+					if !isFromMe {
+						if rawMsg, ok := data["RawMessage"].(map[string]interface{}); ok {
+							if key, ok := rawMsg["key"].(map[string]interface{}); ok {
+								if fromMeVal, ok := key["fromMe"].(bool); ok {
+									isFromMe = fromMeVal
+								}
+							}
+						}
+					}
+				}
+			}
+			// Fallback: check if sender_jid is "me" (for messages sent via API)
+			if !isFromMe && msg.SenderJID == "me" {
+				isFromMe = true
+			}
+
+			messageType := "0"
+			senderType := "Contact"
+			senderID := contact.ID
+			if isFromMe {
+				messageType = "1"
+				senderType = chatwootUser.UserType
+				senderID = chatwootUser.UserID
+			}
+
+			// Get content
+			content := msg.TextContent
+			if content == "" && msg.MediaLink != "" {
+				content = fmt.Sprintf("[Media: %s]", msg.MessageType)
+			}
+
+			// Handle quoted messages
+			var inReplyTo *int
+			if msg.QuotedMessageID != "" {
+				var quotedMsgID int
+				err := chatwootDB.QueryRowContext(ctx, `
+					SELECT id FROM messages 
+					WHERE inbox_id = $1 AND conversation_id = $2 AND source_id = $3`,
+					inboxIDInt, conversationID, fmt.Sprintf("WAID:%s", msg.QuotedMessageID)).Scan(&quotedMsgID)
+				if err == nil {
+					inReplyTo = &quotedMsgID
+				}
+			}
+
+			messagesToInsert = append(messagesToInsert, struct {
+				content      string
+				messageType  string
+				senderType   string
+				senderID     int
+				sourceID     string
+				timestamp    time.Time
+				inReplyTo    *int
+			}{
+				content:     content,
+				messageType: messageType,
+				senderType:  senderType,
+				senderID:    senderID,
+				sourceID:    sourceID,
+				timestamp:   msg.Timestamp,
+				inReplyTo:   inReplyTo,
+			})
+		}
+
+		// Insert messages in batches
+		batchSize := 1000
+		for i := 0; i < len(messagesToInsert); i += batchSize {
+			end := i + batchSize
+			if end > len(messagesToInsert) {
+				end = len(messagesToInsert)
+			}
+			batch := messagesToInsert[i:end]
+
+			// Build batch insert query
+			var values []string
+			var args []interface{}
+			argIndex := 1
+
+			for _, msgData := range batch {
+				// Build content_attributes JSON for in_reply_to if needed
+				var contentAttributes interface{}
+				if msgData.inReplyTo != nil {
+					contentAttributes = map[string]interface{}{
+						"in_reply_to": *msgData.inReplyTo,
+					}
+				} else {
+					contentAttributes = map[string]interface{}{}
+				}
+
+				// Convert to JSON string for PostgreSQL JSONB
+				contentAttributesJSON, err := json.Marshal(contentAttributes)
+				if err != nil {
+					contentAttributesJSON = []byte("{}")
+				}
+
+				values = append(values, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d::jsonb, $%d, to_timestamp($%d), to_timestamp($%d))",
+					argIndex,   // content
+					argIndex+1, // processed_message_content
+					argIndex+2, // account_id
+					argIndex+3, // inbox_id
+					argIndex+4, // conversation_id
+					argIndex+5, // message_type
+					argIndex+6, // private
+					argIndex+7, // content_type
+					argIndex+8, // sender_type
+					argIndex+9, // sender_id
+					argIndex+10, // source_id
+					argIndex+11, // content_attributes (cast to jsonb)
+					argIndex+12, // status
+					argIndex+13, // timestamp
+					argIndex+13)) // updated_at uses same timestamp
+
+				args = append(args, msgData.content, msgData.content, accountIDInt, inboxIDInt, conversationID,
+					msgData.messageType, false, 0, msgData.senderType, msgData.senderID, msgData.sourceID,
+					string(contentAttributesJSON), 0, msgData.timestamp.Unix())
+
+				argIndex += 14
+			}
+
+			query := fmt.Sprintf(`
+				INSERT INTO messages 
+				(content, processed_message_content, account_id, inbox_id, conversation_id, message_type, private, content_type,
+				 sender_type, sender_id, source_id, content_attributes, status, created_at, updated_at)
+				VALUES %s`,
+				strings.Join(values, ", "))
+
+			_, err = chatwootDB.ExecContext(ctx, query, args...)
+			if err != nil {
+				log.Warn().Err(err).Int("batch_start", i).Int("batch_end", end).Msg("Failed to insert message batch")
+				errorCount += len(batch)
+			} else {
+				importedCount += len(batch)
+			}
+		}
+	}
+
+	log.Info().Str("userID", userID).
+		Int("imported", importedCount).
+		Int("errors", errorCount).
+		Int("total", len(messages)).
+		Msg("Chat history import completed")
+
+	return nil
 }
 
