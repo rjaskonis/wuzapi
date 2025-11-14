@@ -7443,6 +7443,12 @@ func (s *server) ChatwootWebhookCallback() http.HandlerFunc {
 					continue
 				}
 				
+				// Validate that we actually got data
+				if len(attachmentData) == 0 {
+					log.Error().Str("url", dataURL).Str("file_type", fileType).Msg("Downloaded attachment is empty (0 bytes), skipping")
+					continue
+				}
+				
 				// Determine media type from file_type or content-type
 				mediaType := whatsmeow.MediaDocument
 				if fileType == "image" {

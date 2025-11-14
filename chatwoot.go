@@ -769,31 +769,45 @@ func sendTextMessage(client *resty.Client, accountID string, conversationID int,
 
 // sendMessageWithAttachment sends a message with an attachment to Chatwoot
 func sendMessageWithAttachment(client *resty.Client, accountID string, conversationID int, content string, messageType string, attachmentData []byte, filename, contentType string, replyID *int, sourceID string) error {
+	// Validate attachment data
+	if len(attachmentData) == 0 {
+		return fmt.Errorf("attachment data is empty")
+	}
+	
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	
 	// Add content field (only if content is provided, matching TypeScript behavior)
 	// In TypeScript: if (content) { data.append('content', content); }
 	if content != "" {
-		writer.WriteField("content", content)
+		if err := writer.WriteField("content", content); err != nil {
+			writer.Close()
+			return fmt.Errorf("failed to write content field: %w", err)
+		}
 	}
-	writer.WriteField("message_type", messageType)
+	if err := writer.WriteField("message_type", messageType); err != nil {
+		writer.Close()
+		return fmt.Errorf("failed to write message_type field: %w", err)
+	}
 	
 	if sourceID != "" {
-		writer.WriteField("source_id", sourceID)
+		if err := writer.WriteField("source_id", sourceID); err != nil {
+			writer.Close()
+			return fmt.Errorf("failed to write source_id field: %w", err)
+		}
 	}
 	
 	if replyID != nil {
 		replyIDStr := fmt.Sprintf("%d", *replyID)
-		writer.WriteField("content_attributes[in_reply_to]", replyIDStr)
-		writer.WriteField("content_attributes[in_reply_to_external_id]", "")
+		if err := writer.WriteField("content_attributes[in_reply_to]", replyIDStr); err != nil {
+			writer.Close()
+			return fmt.Errorf("failed to write in_reply_to field: %w", err)
+		}
+		if err := writer.WriteField("content_attributes[in_reply_to_external_id]", ""); err != nil {
+			writer.Close()
+			return fmt.Errorf("failed to write in_reply_to_external_id field: %w", err)
+		}
 	}
-	
-	// Create form file part with explicit Content-Type header
-	// This ensures Chatwoot recognizes images and audio properly
-	// Following the pattern from TypeScript FormData.append('attachments[]', fileStream, { filename })
-	var part io.Writer
-	var err error
 	
 	// Determine Content-Type: use provided contentType, or detect from filename extension
 	detectedContentType := contentType
@@ -806,36 +820,67 @@ func sendMessageWithAttachment(client *resty.Client, accountID string, conversat
 		}
 	}
 	
-	// Create multipart part with explicit Content-Type header
-	// This matches how FormData library in TypeScript handles it
+	// Create file part using CreatePart with explicit headers
+	// This gives us full control over Content-Disposition and Content-Type
+	// Rails/ActiveStorage expects the file in attachments[] array format
 	header := make(textproto.MIMEHeader)
 	header.Set("Content-Disposition", fmt.Sprintf(`form-data; name="attachments[]"; filename="%s"`, filename))
 	header.Set("Content-Type", detectedContentType)
 	
-	part, err = writer.CreatePart(header)
+	part, err := writer.CreatePart(header)
 	if err != nil {
+		writer.Close()
 		return fmt.Errorf("failed to create multipart part: %w", err)
 	}
 	
-	_, err = part.Write(attachmentData)
+	// Write attachment data using io.Copy to ensure all data is written
+	// Using a bytes.Reader ensures we can write the full content
+	dataReader := bytes.NewReader(attachmentData)
+	bytesWritten, err := io.Copy(part, dataReader)
 	if err != nil {
+		writer.Close()
 		return fmt.Errorf("failed to write attachment data: %w", err)
 	}
 	
-	err = writer.Close()
-	if err != nil {
+	if bytesWritten != int64(len(attachmentData)) {
+		writer.Close()
+		return fmt.Errorf("incomplete write: wrote %d of %d bytes", bytesWritten, len(attachmentData))
+	}
+	
+	// Get content type before closing writer
+	contentTypeHeader := writer.FormDataContentType()
+	
+	// Close writer to finalize multipart data
+	if err := writer.Close(); err != nil {
 		return fmt.Errorf("failed to close multipart writer: %w", err)
 	}
 	
+	// Validate that body has data
+	if body.Len() == 0 {
+		return fmt.Errorf("multipart body is empty after writing")
+	}
+	
+	bodySize := body.Len()
+	log.Debug().
+		Int("body_size", bodySize).
+		Int("attachment_size", len(attachmentData)).
+		Str("filename", filename).
+		Str("content_type", detectedContentType).
+		Msg("Sending attachment to Chatwoot")
+	
+	// Create request with body as io.Reader using bytes.NewReader to ensure we read from the beginning
+	// Using bytes.NewReader ensures the body is read from position 0
 	req, err := http.NewRequest("POST", 
 		fmt.Sprintf("%s/api/v1/accounts/%s/conversations/%d/messages", 
-			strings.TrimSuffix(client.BaseURL, "/"), accountID, conversationID), &body)
+			strings.TrimSuffix(client.BaseURL, "/"), accountID, conversationID), bytes.NewReader(body.Bytes()))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 	
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	// Set headers
+	req.Header.Set("Content-Type", contentTypeHeader)
 	req.Header.Set("api_access_token", client.Header.Get("api_access_token"))
+	req.ContentLength = int64(bodySize)
 	
 	httpClient := &http.Client{Timeout: 60 * time.Second}
 	resp, err := httpClient.Do(req)
@@ -844,10 +889,28 @@ func sendMessageWithAttachment(client *resty.Client, accountID string, conversat
 	}
 	defer resp.Body.Close()
 	
+	// Read response body for debugging
+	respBodyBytes, _ := io.ReadAll(resp.Body)
+	
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to send message with attachment: status %d, body: %s", resp.StatusCode, string(bodyBytes))
+		return fmt.Errorf("failed to send message with attachment: status %d, body: %s", resp.StatusCode, string(respBodyBytes))
 	}
+	
+	// Log response for debugging (first 500 chars to avoid huge logs)
+	respPreview := string(respBodyBytes)
+	if len(respPreview) > 500 {
+		respPreview = respPreview[:500] + "..."
+	}
+	log.Debug().
+		Str("response_preview", respPreview).
+		Int("response_size", len(respBodyBytes)).
+		Msg("Chatwoot response received")
+	
+	log.Info().
+		Int("status", resp.StatusCode).
+		Int("attachment_size", len(attachmentData)).
+		Str("filename", filename).
+		Msg("Attachment sent successfully to Chatwoot")
 	
 	return nil
 }
@@ -869,6 +932,31 @@ func downloadMediaFromBase64(base64Data string) ([]byte, error) {
 	data, err := base64.StdEncoding.DecodeString(base64Data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode base64: %w", err)
+	}
+	
+	return data, nil
+}
+
+// downloadMediaFromURL downloads media from a URL (e.g., S3 URL)
+func downloadMediaFromURL(url string) ([]byte, error) {
+	if url == "" {
+		return nil, fmt.Errorf("empty URL")
+	}
+	
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download from URL: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to download from URL: status %d", resp.StatusCode)
+	}
+	
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 	
 	return data, nil
@@ -935,10 +1023,10 @@ func (s *server) ProcessIncomingMessage(userID string, phone, content, senderPho
 	
 	// Send message based on type
 	if video != nil {
-		// Send video
+		// Send video - match ProcessOutgoingMessage logic
 		videoBase64, _ := video["base64"].(string)
 		videoData, err := downloadMediaFromBase64(videoBase64)
-		if err == nil {
+		if err == nil && videoData != nil && len(videoData) > 0 {
 			mimeType, _ := video["mimeType"].(string)
 			if mimeType == "" {
 				mimeType = "video/mp4"
@@ -955,11 +1043,34 @@ func (s *server) ProcessIncomingMessage(userID string, phone, content, senderPho
 			}
 			return nil
 		}
+		// If base64 failed, try S3 URL
+		if s3url, ok := video["s3url"].(string); ok && s3url != "" {
+			videoData, err = downloadMediaFromURL(s3url)
+			if err == nil && videoData != nil && len(videoData) > 0 {
+				mimeType, _ := video["mimeType"].(string)
+				if mimeType == "" {
+					mimeType = "video/mp4"
+				}
+				caption, _ := video["caption"].(string)
+				if content == "" {
+					content = caption
+				}
+				filename := fmt.Sprintf("video_%d.mp4", time.Now().Unix())
+				err = sendMessageWithAttachment(client, config.AccountID, conversation.ID, content, "incoming", videoData, filename, mimeType, replyID, sourceID)
+				if err != nil {
+					log.Warn().Err(err).Msg("Failed to send video from S3, falling back to text")
+					return sendTextMessage(client, config.AccountID, conversation.ID, content+" [Video]", "incoming", replyID, sourceID)
+				}
+				return nil
+			}
+		}
+		log.Warn().Msg("Video has no valid base64 or S3 URL, falling back to text")
+		return sendTextMessage(client, config.AccountID, conversation.ID, content+" [Video]", "incoming", replyID, sourceID)
 	} else if document != nil {
-		// Send document
+		// Send document - match ProcessOutgoingMessage logic
 		docBase64, _ := document["base64"].(string)
 		docData, err := downloadMediaFromBase64(docBase64)
-		if err == nil {
+		if err == nil && docData != nil && len(docData) > 0 {
 			mimeType, _ := document["mimeType"].(string)
 			if mimeType == "" {
 				mimeType = "application/octet-stream"
@@ -979,11 +1090,37 @@ func (s *server) ProcessIncomingMessage(userID string, phone, content, senderPho
 			}
 			return nil
 		}
+		// If base64 failed, try S3 URL
+		if s3url, ok := document["s3url"].(string); ok && s3url != "" {
+			docData, err = downloadMediaFromURL(s3url)
+			if err == nil && docData != nil && len(docData) > 0 {
+				mimeType, _ := document["mimeType"].(string)
+				if mimeType == "" {
+					mimeType = "application/octet-stream"
+				}
+				fileName, _ := document["fileName"].(string)
+				if fileName == "" {
+					fileName = "document"
+				}
+				caption, _ := document["caption"].(string)
+				if content == "" {
+					content = caption
+				}
+				err = sendMessageWithAttachment(client, config.AccountID, conversation.ID, content, "incoming", docData, fileName, mimeType, replyID, sourceID)
+				if err != nil {
+					log.Warn().Err(err).Msg("Failed to send document from S3, falling back to text")
+					return sendTextMessage(client, config.AccountID, conversation.ID, content+" [Document]", "incoming", replyID, sourceID)
+				}
+				return nil
+			}
+		}
+		log.Warn().Msg("Document has no valid base64 or S3 URL, falling back to text")
+		return sendTextMessage(client, config.AccountID, conversation.ID, content+" [Document]", "incoming", replyID, sourceID)
 	} else if audio != nil {
-		// Send audio
+		// Send audio - match ProcessOutgoingMessage logic
 		audioBase64, _ := audio["base64"].(string)
 		audioData, err := downloadMediaFromBase64(audioBase64)
-		if err == nil {
+		if err == nil && audioData != nil && len(audioData) > 0 {
 			mimeType, _ := audio["mimeType"].(string)
 			// Clean mimeType - remove any parameters (e.g., "audio/ogg; codecs=opus" -> "audio/ogg")
 			if mimeType != "" {
@@ -1019,11 +1156,50 @@ func (s *server) ProcessIncomingMessage(userID string, phone, content, senderPho
 			}
 			return nil
 		}
+		// If base64 failed, try S3 URL
+		if s3url, ok := audio["s3url"].(string); ok && s3url != "" {
+			audioData, err = downloadMediaFromURL(s3url)
+			if err == nil && audioData != nil && len(audioData) > 0 {
+				mimeType, _ := audio["mimeType"].(string)
+				// Clean mimeType - remove any parameters
+				if mimeType != "" {
+					parts := strings.Split(mimeType, ";")
+					mimeType = strings.TrimSpace(parts[0])
+				}
+				if mimeType == "" {
+					mimeType = "audio/ogg"
+				}
+				// Extract extension from mimeType
+				ext := "ogg"
+				if strings.Contains(mimeType, "mp3") || strings.Contains(mimeType, "mpeg") {
+					ext = "mp3"
+					mimeType = "audio/mpeg"
+				} else if strings.Contains(mimeType, "m4a") || strings.Contains(mimeType, "mp4a") {
+					ext = "m4a"
+					mimeType = "audio/mp4"
+				} else if strings.Contains(mimeType, "ogg") {
+					ext = "ogg"
+					mimeType = "audio/ogg"
+				} else if strings.Contains(mimeType, "wav") {
+					ext = "wav"
+					mimeType = "audio/wav"
+				}
+				filename := fmt.Sprintf("audio.%s", ext)
+				err = sendMessageWithAttachment(client, config.AccountID, conversation.ID, "", "incoming", audioData, filename, mimeType, replyID, sourceID)
+				if err != nil {
+					log.Warn().Err(err).Msg("Failed to send audio from S3")
+					return err
+				}
+				return nil
+			}
+		}
+		log.Warn().Msg("Audio has no valid base64 or S3 URL")
+		return fmt.Errorf("audio has no valid base64 or S3 URL")
 	} else if image != nil {
-		// Send image
+		// Send image - match ProcessOutgoingMessage logic
 		imageBase64, _ := image["base64"].(string)
 		imageData, err := downloadMediaFromBase64(imageBase64)
-		if err == nil {
+		if err == nil && imageData != nil && len(imageData) > 0 {
 			mimeType, _ := image["mimeType"].(string)
 			if mimeType == "" {
 				mimeType = "image/jpeg"
@@ -1048,6 +1224,37 @@ func (s *server) ProcessIncomingMessage(userID string, phone, content, senderPho
 			}
 			return nil
 		}
+		// If base64 failed, try S3 URL
+		if s3url, ok := image["s3url"].(string); ok && s3url != "" {
+			imageData, err = downloadMediaFromURL(s3url)
+			if err == nil && imageData != nil && len(imageData) > 0 {
+				mimeType, _ := image["mimeType"].(string)
+				if mimeType == "" {
+					mimeType = "image/jpeg"
+				}
+				caption, _ := image["caption"].(string)
+				if content == "" {
+					content = caption
+				}
+				ext := "jpg"
+				if strings.Contains(mimeType, "png") {
+					ext = "png"
+				} else if strings.Contains(mimeType, "gif") {
+					ext = "gif"
+				} else if strings.Contains(mimeType, "webp") {
+					ext = "webp"
+				}
+				filename := fmt.Sprintf("image.%s", ext)
+				err = sendMessageWithAttachment(client, config.AccountID, conversation.ID, content, "incoming", imageData, filename, mimeType, replyID, sourceID)
+				if err != nil {
+					log.Warn().Err(err).Msg("Failed to send image from S3, falling back to text")
+					return sendTextMessage(client, config.AccountID, conversation.ID, content+" [Image]", "incoming", replyID, sourceID)
+				}
+				return nil
+			}
+		}
+		log.Warn().Msg("Image has no valid base64 or S3 URL, falling back to text")
+		return sendTextMessage(client, config.AccountID, conversation.ID, content+" [Image]", "incoming", replyID, sourceID)
 	}
 	
 	// Send text message
@@ -1107,7 +1314,7 @@ func (s *server) ProcessOutgoingMessage(userID string, phone, content string, li
 		// Send video
 		videoBase64, _ := video["base64"].(string)
 		videoData, err := downloadMediaFromBase64(videoBase64)
-		if err == nil {
+		if err == nil && videoData != nil && len(videoData) > 0 {
 			mimeType, _ := video["mimeType"].(string)
 			if mimeType == "" {
 				mimeType = "video/mp4"
@@ -1128,7 +1335,7 @@ func (s *server) ProcessOutgoingMessage(userID string, phone, content string, li
 		// Send document
 		docBase64, _ := document["base64"].(string)
 		docData, err := downloadMediaFromBase64(docBase64)
-		if err == nil {
+		if err == nil && docData != nil && len(docData) > 0 {
 			mimeType, _ := document["mimeType"].(string)
 			if mimeType == "" {
 				mimeType = "application/octet-stream"
@@ -1152,7 +1359,7 @@ func (s *server) ProcessOutgoingMessage(userID string, phone, content string, li
 		// Send audio
 		audioBase64, _ := audio["base64"].(string)
 		audioData, err := downloadMediaFromBase64(audioBase64)
-		if err == nil {
+		if err == nil && audioData != nil && len(audioData) > 0 {
 			mimeType, _ := audio["mimeType"].(string)
 			// Clean mimeType - remove any parameters
 			if mimeType != "" {
@@ -1189,7 +1396,7 @@ func (s *server) ProcessOutgoingMessage(userID string, phone, content string, li
 		// Send image
 		imageBase64, _ := image["base64"].(string)
 		imageData, err := downloadMediaFromBase64(imageBase64)
-		if err == nil {
+		if err == nil && imageData != nil && len(imageData) > 0 {
 			mimeType, _ := image["mimeType"].(string)
 			if mimeType == "" {
 				mimeType = "image/jpeg"

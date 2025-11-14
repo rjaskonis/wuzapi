@@ -1649,35 +1649,103 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 						}
 					} else if img := evt.Message.GetImageMessage(); img != nil {
 						image = make(map[string]interface{})
-						if base64, ok := postmap["base64"].(string); ok {
+						hasBase64 := false
+						hasS3URL := false
+						
+						if base64, ok := postmap["base64"].(string); ok && base64 != "" {
 							image["base64"] = base64
+							hasBase64 = true
 						}
 						if mimeType, ok := postmap["mimeType"].(string); ok {
 							image["mimeType"] = mimeType
 						}
-						if caption := img.GetCaption(); caption != "" {
-							image["caption"] = caption
-							if content == "" {
-								content = caption
+						// Pass S3 URL if available
+						if s3Data, ok := postmap["s3"].(map[string]interface{}); ok {
+							if url, ok := s3Data["url"].(string); ok && url != "" {
+								image["s3url"] = url
+								hasS3URL = true
+							}
+						}
+						
+						// If neither base64 nor S3 URL is available, download media and create base64
+						if !hasBase64 && !hasS3URL {
+							log.Info().Str("messageID", evt.Info.ID).Msg("No base64 or S3 URL for image, downloading and converting to base64")
+							data, err := mycli.WAClient.Download(context.Background(), img)
+							if err == nil {
+								base64Str := base64.StdEncoding.EncodeToString(data)
+								image["base64"] = base64Str
+								if mimeType, ok := postmap["mimeType"].(string); ok && mimeType != "" {
+									image["mimeType"] = mimeType
+								} else {
+									image["mimeType"] = img.GetMimetype()
+								}
+							} else {
+								log.Warn().Err(err).Str("messageID", evt.Info.ID).Msg("Failed to download image for Chatwoot, skipping media")
+								image = nil
+							}
+						}
+						
+						if image != nil {
+							if caption := img.GetCaption(); caption != "" {
+								image["caption"] = caption
+								if content == "" {
+									content = caption
+								}
 							}
 						}
 					}
 					
 					if aud := evt.Message.GetAudioMessage(); aud != nil {
 						audio = make(map[string]interface{})
-						if base64, ok := postmap["base64"].(string); ok {
+						hasBase64 := false
+						hasS3URL := false
+						
+						if base64, ok := postmap["base64"].(string); ok && base64 != "" {
 							audio["base64"] = base64
+							hasBase64 = true
 						}
 						if mimeType, ok := postmap["mimeType"].(string); ok {
 							audio["mimeType"] = mimeType
 						}
-						audio["seconds"] = float64(aud.GetSeconds())
+						// Pass S3 URL if available
+						if s3Data, ok := postmap["s3"].(map[string]interface{}); ok {
+							if url, ok := s3Data["url"].(string); ok && url != "" {
+								audio["s3url"] = url
+								hasS3URL = true
+							}
+						}
+						
+						// If neither base64 nor S3 URL is available, download media and create base64
+						if !hasBase64 && !hasS3URL {
+							log.Info().Str("messageID", evt.Info.ID).Msg("No base64 or S3 URL for audio, downloading and converting to base64")
+							data, err := mycli.WAClient.Download(context.Background(), aud)
+							if err == nil {
+								base64Str := base64.StdEncoding.EncodeToString(data)
+								audio["base64"] = base64Str
+								if mimeType, ok := postmap["mimeType"].(string); ok && mimeType != "" {
+									audio["mimeType"] = mimeType
+								} else {
+									audio["mimeType"] = aud.GetMimetype()
+								}
+							} else {
+								log.Warn().Err(err).Str("messageID", evt.Info.ID).Msg("Failed to download audio for Chatwoot, skipping media")
+								audio = nil
+							}
+						}
+						
+						if audio != nil {
+							audio["seconds"] = float64(aud.GetSeconds())
+						}
 					}
 					
 					if doc := evt.Message.GetDocumentMessage(); doc != nil {
 						document = make(map[string]interface{})
-						if base64, ok := postmap["base64"].(string); ok {
+						hasBase64 := false
+						hasS3URL := false
+						
+						if base64, ok := postmap["base64"].(string); ok && base64 != "" {
 							document["base64"] = base64
+							hasBase64 = true
 						}
 						if mimeType, ok := postmap["mimeType"].(string); ok {
 							document["mimeType"] = mimeType
@@ -1685,29 +1753,96 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 						if fileName, ok := postmap["fileName"].(string); ok {
 							document["fileName"] = fileName
 						}
-						if caption := doc.GetCaption(); caption != "" {
-							document["caption"] = caption
-							if content == "" {
-								content = caption
+						// Pass S3 URL if available
+						if s3Data, ok := postmap["s3"].(map[string]interface{}); ok {
+							if url, ok := s3Data["url"].(string); ok && url != "" {
+								document["s3url"] = url
+								hasS3URL = true
+							}
+						}
+						
+						// If neither base64 nor S3 URL is available, download media and create base64
+						if !hasBase64 && !hasS3URL {
+							log.Info().Str("messageID", evt.Info.ID).Msg("No base64 or S3 URL for document, downloading and converting to base64")
+							data, err := mycli.WAClient.Download(context.Background(), doc)
+							if err == nil {
+								base64Str := base64.StdEncoding.EncodeToString(data)
+								document["base64"] = base64Str
+								if mimeType, ok := postmap["mimeType"].(string); ok && mimeType != "" {
+									document["mimeType"] = mimeType
+								} else {
+									document["mimeType"] = doc.GetMimetype()
+								}
+								if fileName, ok := postmap["fileName"].(string); ok && fileName != "" {
+									document["fileName"] = fileName
+								} else if doc.FileName != nil {
+									document["fileName"] = *doc.FileName
+								} else {
+									document["fileName"] = "document"
+								}
+							} else {
+								log.Warn().Err(err).Str("messageID", evt.Info.ID).Msg("Failed to download document for Chatwoot, skipping media")
+								document = nil
+							}
+						}
+						
+						if document != nil {
+							if caption := doc.GetCaption(); caption != "" {
+								document["caption"] = caption
+								if content == "" {
+									content = caption
+								}
 							}
 						}
 					}
 					
 					if vid := evt.Message.GetVideoMessage(); vid != nil {
 						video = make(map[string]interface{})
-						if base64, ok := postmap["base64"].(string); ok {
+						hasBase64 := false
+						hasS3URL := false
+						
+						if base64, ok := postmap["base64"].(string); ok && base64 != "" {
 							video["base64"] = base64
+							hasBase64 = true
 						}
 						if mimeType, ok := postmap["mimeType"].(string); ok {
 							video["mimeType"] = mimeType
 						}
-						if caption := vid.GetCaption(); caption != "" {
-							video["caption"] = caption
-							if content == "" {
-								content = caption
+						// Pass S3 URL if available
+						if s3Data, ok := postmap["s3"].(map[string]interface{}); ok {
+							if url, ok := s3Data["url"].(string); ok && url != "" {
+								video["s3url"] = url
+								hasS3URL = true
 							}
 						}
-						video["seconds"] = float64(vid.GetSeconds())
+						
+						// If neither base64 nor S3 URL is available, download media and create base64
+						if !hasBase64 && !hasS3URL {
+							log.Info().Str("messageID", evt.Info.ID).Msg("No base64 or S3 URL for video, downloading and converting to base64")
+							data, err := mycli.WAClient.Download(context.Background(), vid)
+							if err == nil {
+								base64Str := base64.StdEncoding.EncodeToString(data)
+								video["base64"] = base64Str
+								if mimeType, ok := postmap["mimeType"].(string); ok && mimeType != "" {
+									video["mimeType"] = mimeType
+								} else {
+									video["mimeType"] = vid.GetMimetype()
+								}
+							} else {
+								log.Warn().Err(err).Str("messageID", evt.Info.ID).Msg("Failed to download video for Chatwoot, skipping media")
+								video = nil
+							}
+						}
+						
+						if video != nil {
+							if caption := vid.GetCaption(); caption != "" {
+								video["caption"] = caption
+								if content == "" {
+									content = caption
+								}
+							}
+							video["seconds"] = float64(vid.GetSeconds())
+						}
 					}
 					
 					// Get sender photo (avatar) - would need to be fetched separately
