@@ -777,21 +777,33 @@ func (s *server) GetStatus() http.HandlerFunc {
 		}
 		hmacConfigured := len(hmacKey) > 0
 
+		// Get days_to_sync_history and ignore_groups from database
+		var daysToSyncHistory int64
+		var ignoreGroups bool
+		err = s.db.QueryRow("SELECT COALESCE(days_to_sync_history, 0), COALESCE(ignore_groups, true) FROM users WHERE id = $1", txtid).Scan(&daysToSyncHistory, &ignoreGroups)
+		if err != nil && err != sql.ErrNoRows {
+			log.Warn().Err(err).Str("userID", txtid).Msg("Failed to query days_to_sync_history and ignore_groups")
+			daysToSyncHistory = 0
+			ignoreGroups = true
+		}
+
 		response := map[string]interface{}{
-			"id":              txtid,
-			"name":            userInfo.Get("Name"),
-			"connected":       isConnected,
-			"loggedIn":        isLoggedIn,
-			"token":           userInfo.Get("Token"),
-			"jid":             userInfo.Get("Jid"),
-			"webhook":         userInfo.Get("Webhook"),
-			"events":          userInfo.Get("Events"),
-			"proxy_url":       userInfo.Get("Proxy"),
-			"qrcode":          userInfo.Get("Qrcode"),
-			"history":         userInfo.Get("History"),
-			"proxy_config":    proxyConfig,
-			"s3_config":       s3Config,
-			"hmac_configured": hmacConfigured,
+			"id":                  txtid,
+			"name":                userInfo.Get("Name"),
+			"connected":           isConnected,
+			"loggedIn":            isLoggedIn,
+			"token":               userInfo.Get("Token"),
+			"jid":                 userInfo.Get("Jid"),
+			"webhook":             userInfo.Get("Webhook"),
+			"events":              userInfo.Get("Events"),
+			"proxy_url":           userInfo.Get("Proxy"),
+			"qrcode":              userInfo.Get("Qrcode"),
+			"history":             userInfo.Get("History"),
+			"days_to_sync_history": daysToSyncHistory,
+			"ignore_groups":       ignoreGroups,
+			"proxy_config":        proxyConfig,
+			"s3_config":           s3Config,
+			"hmac_configured":     hmacConfigured,
 		}
 		responseJson, err := json.Marshal(response)
 		if err != nil {
@@ -4465,17 +4477,19 @@ func (s *server) ListNewsletter() http.HandlerFunc {
 // Admin List users
 func (s *server) ListUsers() http.HandlerFunc {
 	type usersStruct struct {
-		Id         string         `db:"id"`
-		Name       string         `db:"name"`
-		Token      string         `db:"token"`
-		Webhook    string         `db:"webhook"`
-		Jid        string         `db:"jid"`
-		Qrcode     string         `db:"qrcode"`
-		Connected  sql.NullBool   `db:"connected"`
-		Expiration sql.NullInt64  `db:"expiration"`
-		ProxyURL   sql.NullString `db:"proxy_url"`
-		Events     string         `db:"events"`
-		History    sql.NullInt64  `db:"history"`
+		Id                string         `db:"id"`
+		Name              string         `db:"name"`
+		Token             string         `db:"token"`
+		Webhook           string         `db:"webhook"`
+		Jid               string         `db:"jid"`
+		Qrcode            string         `db:"qrcode"`
+		Connected         sql.NullBool   `db:"connected"`
+		Expiration        sql.NullInt64  `db:"expiration"`
+		ProxyURL          sql.NullString `db:"proxy_url"`
+		Events            string         `db:"events"`
+		History           sql.NullInt64  `db:"history"`
+		DaysToSyncHistory int64          `db:"days_to_sync_history"` // Using int64 since COALESCE always returns a value
+		IgnoreGroups      sql.NullBool   `db:"ignore_groups"`
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		vars := mux.Vars(r)
@@ -4486,11 +4500,11 @@ func (s *server) ListUsers() http.HandlerFunc {
 
 		if hasID {
 			// Fetch a single user
-			query = "SELECT id, name, token, webhook, jid, qrcode, connected, expiration, proxy_url, events, history FROM users WHERE id = $1"
+			query = "SELECT id, name, token, webhook, jid, qrcode, connected, expiration, proxy_url, events, history, COALESCE(days_to_sync_history, 0) as days_to_sync_history, COALESCE(ignore_groups, true) as ignore_groups FROM users WHERE id = $1"
 			args = append(args, userID)
 		} else {
 			// Fetch all users
-			query = "SELECT id, name, token, webhook, jid, qrcode, connected, expiration, proxy_url, events, history FROM users"
+			query = "SELECT id, name, token, webhook, jid, qrcode, connected, expiration, proxy_url, events, history, COALESCE(days_to_sync_history, 0) as days_to_sync_history, COALESCE(ignore_groups, true) as ignore_groups FROM users"
 		}
 
 		rows, err := s.db.Queryx(query, args...)
@@ -4521,17 +4535,20 @@ func (s *server) ListUsers() http.HandlerFunc {
 
 			//"connected":  user.Connected.Bool,
 			userMap := map[string]interface{}{
-				"id":         user.Id,
-				"name":       user.Name,
-				"token":      user.Token,
-				"webhook":    user.Webhook,
-				"jid":        user.Jid,
-				"qrcode":     user.Qrcode,
-				"connected":  isConnected,
-				"loggedIn":   isLoggedIn,
-				"expiration": user.Expiration.Int64,
-				"proxy_url":  user.ProxyURL.String,
-				"events":     user.Events,
+				"id":                  user.Id,
+				"name":                user.Name,
+				"token":               user.Token,
+				"webhook":             user.Webhook,
+				"jid":                 user.Jid,
+				"qrcode":              user.Qrcode,
+				"connected":           isConnected,
+				"loggedIn":            isLoggedIn,
+				"expiration":          user.Expiration.Int64,
+				"proxy_url":           user.ProxyURL.String,
+				"events":              user.Events,
+				"history":             user.History.Int64,
+				"days_to_sync_history": user.DaysToSyncHistory,
+				"ignore_groups":       user.IgnoreGroups.Bool,
 			}
 			// Add proxy_config
 			proxyURL := user.ProxyURL.String
@@ -4615,6 +4632,7 @@ func (s *server) AddUser() http.HandlerFunc {
 			HmacKey           string       `json:"hmacKey,omitempty"`
 			History           int          `json:"history,omitempty"`
 			DaysToSyncHistory int          `json:"days_to_sync_history,omitempty"`
+			IgnoreGroups      bool         `json:"ignore_groups,omitempty"`
 		}
 
 		if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
@@ -4718,11 +4736,20 @@ func (s *server) AddUser() http.HandlerFunc {
 			return
 		}
 
+		// Set default ignore_groups to true if not provided
+		// The frontend checkbox is checked by default, so it sends true
+		// If not provided (false), default to true
+		ignoreGroups := user.IgnoreGroups
+		if !ignoreGroups {
+			// Default to true if not explicitly set to false
+			ignoreGroups = true
+		}
+		
 		// Insert user with all proxy, S3 and HMAC fields
 		if _, err = s.db.Exec(
-			"INSERT INTO users (id, name, token, webhook, expiration, events, jid, qrcode, proxy_url, s3_enabled, s3_endpoint, s3_region, s3_bucket, s3_access_key, s3_secret_key, s3_path_style, s3_public_url, media_delivery, s3_retention_days, hmac_key, history, days_to_sync_history) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)",
+			"INSERT INTO users (id, name, token, webhook, expiration, events, jid, qrcode, proxy_url, s3_enabled, s3_endpoint, s3_region, s3_bucket, s3_access_key, s3_secret_key, s3_path_style, s3_public_url, media_delivery, s3_retention_days, hmac_key, history, days_to_sync_history, ignore_groups) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)",
 			id, user.Name, user.Token, user.Webhook, user.Expiration, user.Events, "", "", user.ProxyConfig.ProxyURL,
-			user.S3Config.Enabled, user.S3Config.Endpoint, user.S3Config.Region, user.S3Config.Bucket, user.S3Config.AccessKey, user.S3Config.SecretKey, user.S3Config.PathStyle, user.S3Config.PublicURL, user.S3Config.MediaDelivery, user.S3Config.RetentionDays, encryptedHmacKey, user.History, user.DaysToSyncHistory,
+			user.S3Config.Enabled, user.S3Config.Endpoint, user.S3Config.Region, user.S3Config.Bucket, user.S3Config.AccessKey, user.S3Config.SecretKey, user.S3Config.PathStyle, user.S3Config.PublicURL, user.S3Config.MediaDelivery, user.S3Config.RetentionDays, encryptedHmacKey, user.History, user.DaysToSyncHistory, ignoreGroups,
 		); err != nil {
 			log.Error().Str("error", fmt.Sprintf("%v", err)).Msg("admin DB error")
 			s.respondWithJSON(w, http.StatusInternalServerError, map[string]interface{}{
@@ -4801,14 +4828,16 @@ func (s *server) EditUser() http.HandlerFunc {
 
 		// Parse the request body
 		var user struct {
-			Name        string       `json:"name,omitempty"`
-			Token       string       `json:"token,omitempty"`
-			Webhook     string       `json:"webhook,omitempty"`
-			Expiration  int          `json:"expiration,omitempty"`
-			Events      string       `json:"events,omitempty"`
-			ProxyConfig *ProxyConfig `json:"proxyConfig,omitempty"`
-			S3Config    *S3Config    `json:"s3Config,omitempty"`
-			History     int          `json:"history,omitempty"`
+			Name              string       `json:"name,omitempty"`
+			Token             string       `json:"token,omitempty"`
+			Webhook           string       `json:"webhook,omitempty"`
+			Expiration        int          `json:"expiration,omitempty"`
+			Events            string       `json:"events,omitempty"`
+			ProxyConfig       *ProxyConfig `json:"proxyConfig,omitempty"`
+			S3Config          *S3Config    `json:"s3Config,omitempty"`
+			History           int          `json:"history,omitempty"`
+			DaysToSyncHistory int          `json:"days_to_sync_history,omitempty"`
+			IgnoreGroups      *bool        `json:"ignore_groups,omitempty"`
 		}
 
 		if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
@@ -4886,6 +4915,10 @@ func (s *server) EditUser() http.HandlerFunc {
 		addField("expiration", user.Expiration, user.Expiration != 0)
 		addField("events", user.Events, user.Events != "")
 		addField("history", user.History, user.History != 0)
+		addField("days_to_sync_history", user.DaysToSyncHistory, user.DaysToSyncHistory >= 0)
+		if user.IgnoreGroups != nil {
+			addField("ignore_groups", *user.IgnoreGroups, true)
+		}
 
 		// Handle proxy config
 		if user.ProxyConfig != nil {

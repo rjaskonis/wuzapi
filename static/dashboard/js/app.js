@@ -599,6 +599,11 @@ async function addInstance(data) {
   const hmacEnabled = data.hmac_enabled === 'on' || data.hmac_enabled === true;
   const hmacKey = hmacEnabled ? (data.hmac_key || '') : '';
 
+  // Checkbox returns 'on' when checked, undefined when not checked
+  // Default to true (checked) if not provided
+  const ignoreGroupsCheckbox = document.getElementById('ignoreGroups');
+  const ignoreGroups = data.ignore_groups === 'on' || data.ignore_groups === true || (data.ignore_groups === undefined && ignoreGroupsCheckbox && ignoreGroupsCheckbox.checked);
+  
   const payload = {
     name: data.name,
     token: data.token,
@@ -607,6 +612,7 @@ async function addInstance(data) {
     expiration: 0,
     history: parseInt(data.history) || 0,
     days_to_sync_history: parseInt(data.days_to_sync_history) || 0,
+    ignore_groups: ignoreGroups,
     proxyConfig: proxyConfig,
     s3Config: s3Config,
     hmacKey: hmacKey
@@ -1314,6 +1320,14 @@ function populateInstances(instances) {
                           <div class="item">
                               <div class="header">Message History</div>
                               <div class="content">${instance.history || 0} messages per chat</div>
+                          </div>
+                          <div class="item">
+                              <div class="header">Days to Sync Message History</div>
+                              <div class="content">${instance.days_to_sync_history !== undefined && instance.days_to_sync_history !== null ? instance.days_to_sync_history : 0} days</div>
+                          </div>
+                          <div class="item">
+                              <div class="header">Ignore Groups</div>
+                              <div class="content">${instance.ignore_groups !== false ? 'Yes' : 'No'}</div>
                           </div>
                           <div class="item">
                               <div class="header">Proxy</div>

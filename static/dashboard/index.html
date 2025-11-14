@@ -717,6 +717,13 @@
           <input type="number" name="history" id="messageHistory" min="0" value="0" placeholder="0">
           <small>Number of messages to store in history per chat for this instance. Set to 0 to disable message history. This field is disabled when "Days to Sync Message History" is set.</small>
         </div>
+        <div class="field">
+          <div class="ui checkbox">
+            <input type="checkbox" name="ignore_groups" id="ignoreGroups" checked>
+            <label>Ignore Groups</label>
+          </div>
+          <small>When enabled, group messages will be ignored during history sync. Default is enabled.</small>
+        </div>
 
         <!-- Proxy Configuration -->
         <h4 class="ui dividing header">Proxy Configuration (Optional)</h4>

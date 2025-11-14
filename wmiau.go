@@ -681,19 +681,42 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			log.Error().Err(err).Msg(sqlStmt)
 			return
 		}
+	case *events.PairSuccess:
+		log.Info().Str("userid", mycli.userID).Str("token", mycli.token).Str("ID", evt.ID.String()).Str("BusinessName", evt.BusinessName).Str("Platform", evt.Platform).Msg("QR Pair Success")
+		jid := evt.ID
+		sqlStmt := `UPDATE users SET jid=$1 WHERE id=$2`
+		_, err := mycli.db.Exec(sqlStmt, jid, mycli.userID)
+		if err != nil {
+			log.Error().Err(err).Msg(sqlStmt)
+			return
+		}
+
+		myuserinfo, found := userinfocache.Get(mycli.token)
+		if !found {
+			log.Warn().Msg("No user info cached on pairing?")
+		} else {
+			txtid = myuserinfo.(Values).Get("Id")
+			token := myuserinfo.(Values).Get("Token")
+			v := updateUserInfo(myuserinfo, "Jid", fmt.Sprintf("%s", jid))
+			userinfocache.Set(token, v, cache.NoExpiration)
+			log.Info().Str("jid", jid.String()).Str("userid", txtid).Str("token", token).Msg("User information set")
+		}
 		
-		// Check if automatic history sync is enabled and trigger it
+		// Check if automatic history sync is enabled and trigger it after QR code is scanned
 		var daysToSyncHistory int
 		err = mycli.db.Get(&daysToSyncHistory, "SELECT COALESCE(days_to_sync_history, 0) FROM users WHERE id=$1", mycli.userID)
 		if err != nil {
 			log.Warn().Err(err).Str("userID", mycli.userID).Msg("Failed to get days_to_sync_history from database")
 		} else if daysToSyncHistory > 0 {
 			// Trigger history sync in a goroutine to avoid blocking
+			// Wait a bit for the connection to be fully established
 			go func() {
+				time.Sleep(2 * time.Second) // Give WhatsApp time to fully establish connection
+				
 				log.Info().
 					Str("userID", mycli.userID).
 					Int("days", daysToSyncHistory).
-					Msg("Triggering automatic history sync after connection")
+					Msg("Triggering automatic history sync after QR code scan")
 				
 				// Use the SyncWhatsAppHistory logic but for a single user
 				// Calculate message count based on days (estimate: 15 messages per day)
@@ -705,52 +728,47 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					count = 50 // Minimum reasonable count
 				}
 				
-				// Get all chats for this user and sync each one
-				var query string
-				if mycli.db.DriverName() == "postgres" {
-					query = `
-						SELECT DISTINCT chat_jid
-						FROM message_history
-						WHERE user_id = $1
-						ORDER BY chat_jid`
-				} else {
-					query = `
-						SELECT DISTINCT chat_jid
-						FROM message_history
-						WHERE user_id = ?
-						ORDER BY chat_jid`
+				// Get ignore_groups setting
+				var ignoreGroups bool
+				err = mycli.db.Get(&ignoreGroups, "SELECT COALESCE(ignore_groups, true) FROM users WHERE id=$1", mycli.userID)
+				if err != nil {
+					log.Warn().Err(err).Str("userID", mycli.userID).Msg("Failed to get ignore_groups setting, defaulting to true")
+					ignoreGroups = true
 				}
+				
+				// Get chats from WhatsApp (contacts and optionally groups)
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
 				
 				var chatJIDs []string
-				err = mycli.db.Select(&chatJIDs, query, mycli.userID)
-				if err != nil {
-					log.Warn().Err(err).Str("userID", mycli.userID).Msg("Failed to get chat list from database, will try to get from WhatsApp")
+				contacts, err := mycli.WAClient.Store.Contacts.GetAllContacts(ctx)
+				if err == nil {
+					for jid := range contacts {
+						chatJIDs = append(chatJIDs, jid.String())
+					}
 				}
 				
-				// If no chats in database, try to get contacts from WhatsApp
-				if len(chatJIDs) == 0 {
-					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-					defer cancel()
-					
-					contacts, err := mycli.WAClient.Store.Contacts.GetAllContacts(ctx)
-					if err == nil {
-						for jid := range contacts {
-							chatJIDs = append(chatJIDs, jid.String())
-						}
-					}
-					
-					// Also get groups
+				// Only get groups if ignore_groups is false
+				if !ignoreGroups {
 					groups, err := mycli.WAClient.GetJoinedGroups(ctx)
 					if err == nil {
 						for _, group := range groups {
 							chatJIDs = append(chatJIDs, group.JID.String())
 						}
 					}
-				}
-				
-				if len(chatJIDs) == 0 {
-					log.Info().Str("userID", mycli.userID).Msg("No chats found to sync history for")
-					return
+				} else {
+					// Filter out groups if ignore_groups is true
+					filteredChatJIDs := []string{}
+					for _, chatJIDStr := range chatJIDs {
+						chatJID, err := types.ParseJID(chatJIDStr)
+						if err != nil {
+							continue
+						}
+						if chatJID.Server != types.GroupServer && chatJID.Server != types.BroadcastServer {
+							filteredChatJIDs = append(filteredChatJIDs, chatJIDStr)
+						}
+					}
+					chatJIDs = filteredChatJIDs
 				}
 				
 				// Sync each chat with a small delay between requests
@@ -778,28 +796,8 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					Str("userID", mycli.userID).
 					Int("days", daysToSyncHistory).
 					Int("chatsSynced", len(chatJIDs)).
-					Msg("Automatic history sync completed")
+					Msg("Automatic history sync completed after QR code scan")
 			}()
-		}
-	case *events.PairSuccess:
-		log.Info().Str("userid", mycli.userID).Str("token", mycli.token).Str("ID", evt.ID.String()).Str("BusinessName", evt.BusinessName).Str("Platform", evt.Platform).Msg("QR Pair Success")
-		jid := evt.ID
-		sqlStmt := `UPDATE users SET jid=$1 WHERE id=$2`
-		_, err := mycli.db.Exec(sqlStmt, jid, mycli.userID)
-		if err != nil {
-			log.Error().Err(err).Msg(sqlStmt)
-			return
-		}
-
-		myuserinfo, found := userinfocache.Get(mycli.token)
-		if !found {
-			log.Warn().Msg("No user info cached on pairing?")
-		} else {
-			txtid = myuserinfo.(Values).Get("Id")
-			token := myuserinfo.(Values).Get("Token")
-			v := updateUserInfo(myuserinfo, "Jid", fmt.Sprintf("%s", jid))
-			userinfocache.Set(token, v, cache.NoExpiration)
-			log.Info().Str("jid", jid.String()).Str("userid", txtid).Str("token", token).Msg("User information set")
 		}
 	case *events.StreamReplaced:
 		log.Info().Msg("Received StreamReplaced event")
@@ -1652,6 +1650,20 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		// Save HistorySync messages to message_history table
 		if evt.Data != nil && evt.Data.Conversations != nil {
 			go func() {
+				// Get ignore_groups setting from database
+				var ignoreGroups bool
+				err := mycli.db.Get(&ignoreGroups, "SELECT COALESCE(ignore_groups, true) FROM users WHERE id=$1", mycli.userID)
+				if err != nil {
+					log.Warn().Err(err).Str("userID", mycli.userID).Msg("Failed to get ignore_groups setting, defaulting to true")
+					ignoreGroups = true
+				}
+				
+				// Get the account owner's JID for messages sent by the instance
+				accountOwnerJID := ""
+				if mycli.WAClient.Store != nil && mycli.WAClient.Store.ID != nil {
+					accountOwnerJID = mycli.WAClient.Store.ID.ToNonAD().String()
+				}
+				
 				savedCount := 0
 				for _, conv := range evt.Data.Conversations {
 					if conv == nil || conv.ID == nil || conv.Messages == nil {
@@ -1661,6 +1673,11 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					chatJID, err := types.ParseJID(*conv.ID)
 					if err != nil {
 						log.Warn().Err(err).Str("convID", *conv.ID).Msg("Failed to parse conversation JID in HistorySync")
+						continue
+					}
+					
+					// Skip groups if ignore_groups is true
+					if ignoreGroups && (chatJID.Server == types.GroupServer || chatJID.Server == types.BroadcastServer) {
 						continue
 					}
 					
@@ -1680,10 +1697,35 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 							continue
 						}
 						
-						// Determine sender
-						senderJID := "me"
-						if messageKey.GetParticipant() != "" {
-							senderJID = messageKey.GetParticipant()
+						// Determine sender - never use "me", always use actual JID
+						// Use GetFromMe() from MessageKey to determine if message is from account owner
+						// This is more reliable than checking GetParticipant()
+						isFromMe := messageKey.GetFromMe()
+						var senderJID string
+						
+						if isFromMe {
+							// Message from account owner
+							senderJID = accountOwnerJID
+							if senderJID == "" {
+								// Fallback: use chat JID if account owner JID is not available
+								senderJID = chatJID.String()
+							}
+						} else {
+							// Message from someone else
+							participantJID := messageKey.GetParticipant()
+							if chatJID.Server == types.GroupServer || chatJID.Server == types.BroadcastServer {
+								// Group message: use participant JID
+								senderJID = participantJID
+							} else {
+								// Direct message: sender is the chat itself (chat_jid)
+								senderJID = chatJID.String()
+							}
+						}
+						
+						// If senderJID is still empty, skip this message
+						if senderJID == "" {
+							log.Warn().Str("messageID", messageID).Msg("Cannot determine sender JID, skipping message")
+							continue
 						}
 						
 						// Get message content
@@ -1760,10 +1802,71 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 							msgTimestamp = time.Unix(int64(timestamp), 0)
 						}
 						
-						// Serialize message to JSON for datajson field
-						evtJSON, err := json.Marshal(msg)
+						// Parse sender JID for MessageInfo
+						var senderJIDForInfo types.JID
+						if isFromMe {
+							if accountOwnerJID != "" {
+								senderJIDForInfo, _ = types.ParseJID(accountOwnerJID)
+							}
+						} else {
+							if chatJID.Server == types.GroupServer || chatJID.Server == types.BroadcastServer {
+								// Group: use participant JID
+								senderJIDForInfo, _ = types.ParseJID(messageKey.GetParticipant())
+							} else {
+								// Direct message: sender is the chat
+								senderJIDForInfo = chatJID
+							}
+						}
+						
+						// Try to get PushName from store if available
+						pushName := ""
+						if !isFromMe && senderJIDForInfo.User != "" {
+							if mycli.WAClient != nil && mycli.WAClient.Store != nil {
+								if contact, err := mycli.WAClient.Store.Contacts.GetContact(context.Background(), senderJIDForInfo); err == nil {
+									pushName = contact.PushName
+								}
+							}
+						}
+						
+						// Create MessageInfo structure matching events.Message format
+						messageInfo := types.MessageInfo{
+							MessageSource: types.MessageSource{
+								Chat:     chatJID,
+								Sender:   senderJIDForInfo,
+								IsFromMe: isFromMe,
+								IsGroup:  chatJID.Server == types.GroupServer || chatJID.Server == types.BroadcastServer,
+							},
+							ID:        messageID,
+							Timestamp: msgTimestamp,
+							Type:      messageType,
+							PushName:  pushName,
+						}
+						
+						// Create events.Message-like structure for datajson
+						// This matches the format used in regular message events
+						// RawMessage should be the full waE2E.Message structure
+						messageEvent := map[string]interface{}{
+							"Info": messageInfo,
+							"Message": message,
+							"IsEphemeral": false,
+							"IsViewOnce": false,
+							"IsViewOnceV2": false,
+							"IsViewOnceV2Extension": false,
+							"IsDocumentWithCaption": false,
+							"IsLottieSticker": false,
+							"IsBotInvoke": false,
+							"IsEdit": false,
+							"SourceWebMsg": nil,
+							"UnavailableRequestID": "",
+							"RetryCount": 0,
+							"NewsletterMeta": nil,
+							"RawMessage": msg.Message,
+						}
+						
+						// Serialize to JSON for datajson field
+						evtJSON, err := json.Marshal(messageEvent)
 						if err != nil {
-							log.Error().Err(err).Msg("Failed to marshal HistorySync message to JSON")
+							log.Error().Err(err).Msg("Failed to marshal HistorySync message event to JSON")
 							evtJSON = []byte("{}")
 						}
 						

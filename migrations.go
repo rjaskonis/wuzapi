@@ -96,6 +96,11 @@ var migrations = []Migration{
 		Name:  "add_days_to_sync_history",
 		UpSQL: addDaysToSyncHistorySQL,
 	},
+	{
+		ID:    14,
+		Name:  "add_ignore_groups",
+		UpSQL: addIgnoreGroupsSQL,
+	},
 }
 
 const changeIDToStringSQL = `
@@ -615,6 +620,13 @@ func applyMigration(db *sqlx.DB, migration Migration) error {
 		} else {
 			_, err = tx.Exec(migration.UpSQL)
 		}
+	} else if migration.ID == 14 {
+		if db.DriverName() == "sqlite" {
+			// Handle ignore_groups column for SQLite
+			err = addColumnIfNotExistsSQLite(tx, "users", "ignore_groups", "BOOLEAN DEFAULT 1")
+		} else {
+			_, err = tx.Exec(migration.UpSQL)
+		}
 	} else {
 		_, err = tx.Exec(migration.UpSQL)
 	}
@@ -903,6 +915,19 @@ BEGIN
     -- Add days_to_sync_history column if it doesn't exist
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'users' AND column_name = 'days_to_sync_history') THEN
         ALTER TABLE users ADD COLUMN days_to_sync_history INTEGER DEFAULT 0;
+    END IF;
+END $$;
+
+-- SQLite version (handled in code)
+`
+
+const addIgnoreGroupsSQL = `
+-- PostgreSQL version - Add ignore_groups column
+DO $$
+BEGIN
+    -- Add ignore_groups column if it doesn't exist
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'users' AND column_name = 'ignore_groups') THEN
+        ALTER TABLE users ADD COLUMN ignore_groups BOOLEAN DEFAULT true;
     END IF;
 END $$;
 
