@@ -1306,7 +1306,7 @@ func (s *server) ImportChatHistory(userID string, config *ChatwootConfig) error 
 	// Get all messages from message_history for this user
 	var messages []HistoryMessage
 	query := `
-		SELECT id, user_id, chat_jid, sender_jid, message_id, timestamp, message_type, 
+		SELECT id, user_id, chat_jid, sender_jid, sender_name, message_id, timestamp, message_type, 
 		       text_content, media_link, COALESCE(quoted_message_id, '') as quoted_message_id, 
 		       COALESCE(datajson, '') as datajson
 		FROM message_history
@@ -1351,36 +1351,47 @@ func (s *server) ImportChatHistory(userID string, config *ChatwootConfig) error 
 			continue
 		}
 
-		// Check all messages for pushName (not just the first one)
-		// pushName is in Info.PushName in the datajson structure
-		// We only extract pushName from messages sent by the contact (IsFromMe = false)
+		// Find the best sender name from message_history table
+		// We prefer sender_name from incoming messages (not from "me")
 		contactName := phoneNumber
-		var bestPushName string
+		var bestSenderName string
 		for _, msg := range chatMessages {
-			if msg.DataJson != "" {
+			// Only use sender_name from incoming messages (not from instance)
+			// Check if message is from contact by checking sender_jid and datajson
+			isFromMe := false
+			if msg.SenderJID == "me" {
+				isFromMe = true
+			} else if msg.DataJson != "" {
 				var data map[string]interface{}
 				if err := json.Unmarshal([]byte(msg.DataJson), &data); err == nil {
 					if info, ok := data["Info"].(map[string]interface{}); ok {
-						// Check Info.IsFromMe to determine if message is from contact (not from instance)
-						var isFromMe bool
 						if isFromMeVal, ok := info["IsFromMe"].(bool); ok {
 							isFromMe = isFromMeVal
 						}
-						// Extract pushName from Info.PushName only for incoming messages
-						if !isFromMe {
-							if pushName, ok := info["PushName"].(string); ok && pushName != "" && pushName != phoneNumber {
-								bestPushName = pushName
-								contactName = pushName
-								// Continue checking other messages to find the best pushName
-								// (in case there are multiple, we'll use the last non-empty one)
+					}
+					// Also check RawMessage.key.fromMe as fallback
+					if !isFromMe {
+						if rawMsg, ok := data["RawMessage"].(map[string]interface{}); ok {
+							if key, ok := rawMsg["key"].(map[string]interface{}); ok {
+								if fromMeVal, ok := key["fromMe"].(bool); ok {
+									isFromMe = fromMeVal
+								}
 							}
 						}
 					}
 				}
 			}
+			
+			// Use sender_name from incoming messages only
+			if !isFromMe && msg.SenderName != "" && msg.SenderName != phoneNumber {
+				bestSenderName = msg.SenderName
+				contactName = msg.SenderName
+				// Continue checking to find the best sender_name
+				// (we'll use the last non-empty one found)
+			}
 		}
 
-		// Create or find contact
+		// Create or find contact with sender name from message_history
 		contact, err := findOrCreateContact(client, config.AccountID, contactName, chatJID, phoneNumber, "")
 		if err != nil {
 			log.Warn().Err(err).Str("chatJID", chatJID).Msg("Failed to create/find contact")
@@ -1388,11 +1399,11 @@ func (s *server) ImportChatHistory(userID string, config *ChatwootConfig) error 
 			continue
 		}
 
-		// Update contact name with pushName if found and contact name is still phone number
-		if bestPushName != "" {
-			err = updateContactName(chatwootDB, accountIDInt, contact.ID, bestPushName)
+		// Update contact name with sender_name if found and contact name is still phone number
+		if bestSenderName != "" {
+			err = updateContactName(chatwootDB, accountIDInt, contact.ID, bestSenderName)
 			if err != nil {
-				log.Warn().Err(err).Int("contact_id", contact.ID).Str("pushName", bestPushName).Msg("Failed to update contact name")
+				log.Warn().Err(err).Int("contact_id", contact.ID).Str("sender_name", bestSenderName).Msg("Failed to update contact name")
 			}
 		}
 
