@@ -91,6 +91,11 @@ var migrations = []Migration{
 		Name:  "add_chatwoot_mark_read",
 		UpSQL: addChatwootMarkReadSQL,
 	},
+	{
+		ID:    13,
+		Name:  "add_days_to_sync_history",
+		UpSQL: addDaysToSyncHistorySQL,
+	},
 }
 
 const changeIDToStringSQL = `
@@ -603,6 +608,13 @@ func applyMigration(db *sqlx.DB, migration Migration) error {
 		} else {
 			_, err = tx.Exec(migration.UpSQL)
 		}
+	} else if migration.ID == 13 {
+		if db.DriverName() == "sqlite" {
+			// Handle days_to_sync_history column for SQLite
+			err = addColumnIfNotExistsSQLite(tx, "users", "days_to_sync_history", "INTEGER DEFAULT 0")
+		} else {
+			_, err = tx.Exec(migration.UpSQL)
+		}
 	} else {
 		_, err = tx.Exec(migration.UpSQL)
 	}
@@ -878,6 +890,19 @@ BEGIN
     -- Add chatwoot_mark_read column if it doesn't exist
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'users' AND column_name = 'chatwoot_mark_read') THEN
         ALTER TABLE users ADD COLUMN chatwoot_mark_read BOOLEAN DEFAULT false;
+    END IF;
+END $$;
+
+-- SQLite version (handled in code)
+`
+
+const addDaysToSyncHistorySQL = `
+-- PostgreSQL version - Add days_to_sync_history column
+DO $$
+BEGIN
+    -- Add days_to_sync_history column if it doesn't exist
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'users' AND column_name = 'days_to_sync_history') THEN
+        ALTER TABLE users ADD COLUMN days_to_sync_history INTEGER DEFAULT 0;
     END IF;
 END $$;
 

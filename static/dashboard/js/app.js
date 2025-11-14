@@ -399,6 +399,30 @@ document.addEventListener('DOMContentLoaded', function() {
     toggleHmacKeyVisibilityInstance();
   });
 
+  // Days to Sync History - disable Message History when > 0
+  const daysToSyncHistoryInput = document.getElementById('daysToSyncHistory');
+  const messageHistoryInput = document.getElementById('messageHistory');
+  
+  if (daysToSyncHistoryInput && messageHistoryInput) {
+    // Function to update Message History field state
+    function updateMessageHistoryState() {
+      const daysToSync = parseInt(daysToSyncHistoryInput.value) || 0;
+      if (daysToSync > 0) {
+        messageHistoryInput.disabled = true;
+        messageHistoryInput.value = '0';
+      } else {
+        messageHistoryInput.disabled = false;
+      }
+    }
+    
+    // Set initial state
+    updateMessageHistoryState();
+    
+    // Listen for changes
+    daysToSyncHistoryInput.addEventListener('input', updateMessageHistoryState);
+    daysToSyncHistoryInput.addEventListener('change', updateMessageHistoryState);
+  }
+
   // Proxy checkbox toggle is now initialized in DOMContentLoaded
 
   $('#addInstanceButton').click(function() {
@@ -439,6 +463,14 @@ document.addEventListener('DOMContentLoaded', function() {
         rules: [{
           type: 'integer[0..]',
           prompt: 'History must be a non-negative integer'
+        }]
+      },
+      days_to_sync_history: {
+        identifier: 'days_to_sync_history',
+        optional: true,
+        rules: [{
+          type: 'integer[0..]',
+          prompt: 'Days to Sync Message History must be a non-negative integer'
         }]
       },
       proxy_url: {
@@ -574,6 +606,7 @@ async function addInstance(data) {
     webhook: data.webhook_url || '',
     expiration: 0,
     history: parseInt(data.history) || 0,
+    days_to_sync_history: parseInt(data.days_to_sync_history) || 0,
     proxyConfig: proxyConfig,
     s3Config: s3Config,
     hmacKey: hmacKey

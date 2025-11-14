@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -28,9 +29,11 @@ import (
 
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
 
 	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -4602,15 +4605,16 @@ func (s *server) AddUser() http.HandlerFunc {
 
 		// Parse the request body
 		var user struct {
-			Name        string       `json:"name"`
-			Token       string       `json:"token"`
-			Webhook     string       `json:"webhook,omitempty"`
-			Expiration  int          `json:"expiration,omitempty"`
-			Events      string       `json:"events,omitempty"`
-			ProxyConfig *ProxyConfig `json:"proxyConfig,omitempty"`
-			S3Config    *S3Config    `json:"s3Config,omitempty"`
-			HmacKey     string       `json:"hmacKey,omitempty"`
-			History     int          `json:"history,omitempty"`
+			Name              string       `json:"name"`
+			Token             string       `json:"token"`
+			Webhook           string       `json:"webhook,omitempty"`
+			Expiration        int          `json:"expiration,omitempty"`
+			Events            string       `json:"events,omitempty"`
+			ProxyConfig       *ProxyConfig `json:"proxyConfig,omitempty"`
+			S3Config          *S3Config    `json:"s3Config,omitempty"`
+			HmacKey           string       `json:"hmacKey,omitempty"`
+			History           int          `json:"history,omitempty"`
+			DaysToSyncHistory int          `json:"days_to_sync_history,omitempty"`
 		}
 
 		if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
@@ -4716,9 +4720,9 @@ func (s *server) AddUser() http.HandlerFunc {
 
 		// Insert user with all proxy, S3 and HMAC fields
 		if _, err = s.db.Exec(
-			"INSERT INTO users (id, name, token, webhook, expiration, events, jid, qrcode, proxy_url, s3_enabled, s3_endpoint, s3_region, s3_bucket, s3_access_key, s3_secret_key, s3_path_style, s3_public_url, media_delivery, s3_retention_days, hmac_key, history) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
+			"INSERT INTO users (id, name, token, webhook, expiration, events, jid, qrcode, proxy_url, s3_enabled, s3_endpoint, s3_region, s3_bucket, s3_access_key, s3_secret_key, s3_path_style, s3_public_url, media_delivery, s3_retention_days, hmac_key, history, days_to_sync_history) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)",
 			id, user.Name, user.Token, user.Webhook, user.Expiration, user.Events, "", "", user.ProxyConfig.ProxyURL,
-			user.S3Config.Enabled, user.S3Config.Endpoint, user.S3Config.Region, user.S3Config.Bucket, user.S3Config.AccessKey, user.S3Config.SecretKey, user.S3Config.PathStyle, user.S3Config.PublicURL, user.S3Config.MediaDelivery, user.S3Config.RetentionDays, encryptedHmacKey, user.History,
+			user.S3Config.Enabled, user.S3Config.Endpoint, user.S3Config.Region, user.S3Config.Bucket, user.S3Config.AccessKey, user.S3Config.SecretKey, user.S3Config.PathStyle, user.S3Config.PublicURL, user.S3Config.MediaDelivery, user.S3Config.RetentionDays, encryptedHmacKey, user.History, user.DaysToSyncHistory,
 		); err != nil {
 			log.Error().Str("error", fmt.Sprintf("%v", err)).Msg("admin DB error")
 			s.respondWithJSON(w, http.StatusInternalServerError, map[string]interface{}{
@@ -5820,6 +5824,478 @@ func (s *server) GetHistory() http.HandlerFunc {
 			s.Respond(w, r, http.StatusOK, string(responseJson))
 		}
 	}
+}
+
+// GetWhatsAppHistory fetches conversation history directly from WhatsApp for a specific chat
+func (s *server) GetWhatsAppHistory() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		txtid := r.Context().Value("userinfo").(Values).Get("Id")
+
+		if clientManager.GetWhatsmeowClient(txtid) == nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
+			return
+		}
+
+		chatJIDStr := r.URL.Query().Get("chat_jid")
+		if chatJIDStr == "" {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("chat_jid parameter is required"))
+			return
+		}
+
+		// Parse chat JID
+		chatJID, err := types.ParseJID(chatJIDStr)
+		if err != nil {
+			s.Respond(w, r, http.StatusBadRequest, fmt.Errorf("invalid chat_jid format: %w", err))
+			return
+		}
+
+		// Get optional limit parameter (default: 50)
+		limitStr := r.URL.Query().Get("limit")
+		limit := 50
+		if limitStr != "" {
+			var err error
+			limit, err = strconv.Atoi(limitStr)
+			if err != nil || limit <= 0 {
+				s.Respond(w, r, http.StatusBadRequest, errors.New("invalid limit parameter"))
+				return
+			}
+			if limit > 500 {
+				limit = 500 // WhatsApp limit
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		// Channel to receive HistorySync events (buffered to handle multiple events)
+		historySyncChan := make(chan *events.HistorySync, 10)
+		var handlerID uint32
+		var handlerMutex sync.Mutex
+		handlerRemoved := false
+
+		// Register our request in the global map so the main handler can forward HistorySync events
+		historySyncRequestKey := fmt.Sprintf("%s:%s", txtid, chatJIDStr)
+		
+		historySyncRequestsMux.Lock()
+		historySyncRequests[historySyncRequestKey] = historySyncChan
+		historySyncRequestsMux.Unlock()
+		
+		// Cleanup function
+		cleanupRequest := func() {
+			historySyncRequestsMux.Lock()
+			delete(historySyncRequests, historySyncRequestKey)
+			historySyncRequestsMux.Unlock()
+		}
+
+		// Create temporary event handler to capture HistorySync events
+		// Accept any HistorySync event - we'll filter conversations later
+		handlerID = clientManager.GetWhatsmeowClient(txtid).AddEventHandler(func(evt interface{}) {
+			// Log all events to see what's coming through
+			eventType := fmt.Sprintf("%T", evt)
+			log.Debug().
+				Str("userID", txtid).
+				Str("chatJID", chatJIDStr).
+				Str("eventType", eventType).
+				Msg("Event received in history handler")
+			
+			if historySync, ok := evt.(*events.HistorySync); ok {
+				log.Info().
+					Str("userID", txtid).
+					Str("chatJID", chatJIDStr).
+					Bool("hasData", historySync.Data != nil).
+					Msg("HistorySync event received in handler")
+				
+				if historySync.Data != nil {
+					log.Info().
+						Str("userID", txtid).
+						Str("chatJID", chatJIDStr).
+						Bool("hasConversations", historySync.Data.Conversations != nil).
+						Int("conversationCount", func() int {
+							if historySync.Data.Conversations != nil {
+								return len(historySync.Data.Conversations)
+							}
+							return 0
+						}()).
+						Msg("HistorySync data details")
+				}
+				
+				// Send any HistorySync event to the channel
+				// We'll filter by chatJID when processing
+				select {
+				case historySyncChan <- historySync:
+					log.Info().
+						Str("userID", txtid).
+						Str("chatJID", chatJIDStr).
+						Msg("HistorySync event sent to channel")
+				default:
+					log.Warn().
+						Str("userID", txtid).
+						Str("chatJID", chatJIDStr).
+						Msg("HistorySync channel full, dropping event")
+				}
+			}
+		})
+		
+		// Helper function to safely remove handler
+		removeHandler := func() {
+			handlerMutex.Lock()
+			defer handlerMutex.Unlock()
+			if !handlerRemoved {
+				clientManager.GetWhatsmeowClient(txtid).RemoveEventHandler(handlerID)
+				handlerRemoved = true
+			}
+		}
+
+		// Build history sync request
+		lastMessageInfo := &types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:    chatJID,
+				IsGroup: chatJID.Server == types.GroupServer || chatJID.Server == types.BroadcastServer,
+			},
+		}
+
+		historyMsg := clientManager.GetWhatsmeowClient(txtid).BuildHistorySyncRequest(lastMessageInfo, limit)
+		if historyMsg == nil {
+			removeHandler()
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("failed to build history sync request"))
+			return
+		}
+
+		// Send the history sync request
+		myClient := clientManager.GetMyClient(txtid)
+		if myClient == nil || myClient.WAClient == nil || myClient.WAClient.Store == nil || myClient.WAClient.Store.ID == nil {
+			removeHandler()
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("client store not available"))
+			return
+		}
+
+		log.Info().
+			Str("userID", txtid).
+			Str("chatJID", chatJIDStr).
+			Int("limit", limit).
+			Msg("Sending WhatsApp history sync request")
+
+		_, err = clientManager.GetWhatsmeowClient(txtid).SendMessage(
+			ctx,
+			myClient.WAClient.Store.ID.ToNonAD(),
+			historyMsg,
+			whatsmeow.SendRequestExtra{Peer: true},
+		)
+
+		if err != nil {
+			removeHandler()
+			log.Error().
+				Str("userID", txtid).
+				Str("chatJID", chatJIDStr).
+				Err(err).
+				Msg("Failed to send WhatsApp history sync request")
+			s.Respond(w, r, http.StatusInternalServerError, fmt.Errorf("failed to send history sync request: %w", err))
+			return
+		}
+
+		log.Info().
+			Str("userID", txtid).
+			Str("chatJID", chatJIDStr).
+			Uint32("handlerID", handlerID).
+			Msg("History sync request sent, waiting for response (handler registered)")
+
+		// Wait for HistorySync event with timeout
+		// Also log periodically to show we're still waiting
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		
+		select {
+		case historySync := <-historySyncChan:
+			ticker.Stop()
+			log.Info().
+				Str("userID", txtid).
+				Str("chatJID", chatJIDStr).
+				Msg("HistorySync event received, processing")
+			removeHandler()
+			cleanupRequest()
+
+			// Extract messages from HistorySync
+			var messages []map[string]interface{}
+			if historySync.Data != nil && historySync.Data.Conversations != nil {
+				log.Debug().
+					Str("userID", txtid).
+					Str("chatJID", chatJIDStr).
+					Int("conversation_count", len(historySync.Data.Conversations)).
+					Msg("Processing HistorySync conversations")
+				
+				for _, conv := range historySync.Data.Conversations {
+					if conv != nil && conv.ID != nil {
+						convJID, err := types.ParseJID(*conv.ID)
+						if err != nil {
+							log.Debug().
+								Str("userID", txtid).
+								Str("convID", *conv.ID).
+								Err(err).
+								Msg("Failed to parse conversation JID")
+							continue
+						}
+						
+						log.Debug().
+							Str("userID", txtid).
+							Str("requestedChatJID", chatJID.String()).
+							Str("conversationJID", convJID.String()).
+							Msg("Comparing conversation JIDs")
+						
+						if convJID.String() == chatJID.String() {
+							log.Info().
+								Str("userID", txtid).
+								Str("chatJID", chatJIDStr).
+								Int("message_count", len(conv.Messages)).
+								Msg("Found matching conversation")
+							
+							if conv.Messages != nil {
+								for _, msg := range conv.Messages {
+									if msg != nil && msg.Message != nil {
+										msgMap := s.parseHistoryMessage(msg, chatJID)
+										if msgMap != nil {
+											messages = append(messages, msgMap)
+										}
+									}
+								}
+							}
+							break
+						}
+					}
+				}
+				
+				if len(messages) == 0 {
+					log.Warn().
+						Str("userID", txtid).
+						Str("chatJID", chatJIDStr).
+						Msg("No messages found in HistorySync for requested chat")
+				}
+			} else {
+				log.Warn().
+					Str("userID", txtid).
+					Str("chatJID", chatJIDStr).
+					Msg("HistorySync event has no data or conversations")
+			}
+
+			// Sort messages by timestamp (oldest first)
+			// Messages in HistorySync are typically in reverse chronological order
+			// We'll reverse them to get chronological order
+			for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
+				messages[i], messages[j] = messages[j], messages[i]
+			}
+
+			response := map[string]interface{}{
+				"chat_jid": chatJIDStr,
+				"messages": messages,
+				"count":    len(messages),
+			}
+
+			responseJson, err := json.Marshal(response)
+			if err != nil {
+				s.Respond(w, r, http.StatusInternalServerError, fmt.Errorf("failed to marshal response: %w", err))
+				return
+			}
+
+			s.Respond(w, r, http.StatusOK, string(responseJson))
+
+		case <-ticker.C:
+			log.Debug().
+				Str("userID", txtid).
+				Str("chatJID", chatJIDStr).
+				Msg("Still waiting for HistorySync event...")
+			// Continue waiting
+			select {
+			case historySync := <-historySyncChan:
+				ticker.Stop()
+				log.Info().
+					Str("userID", txtid).
+					Str("chatJID", chatJIDStr).
+					Msg("HistorySync event received, processing")
+				removeHandler()
+				cleanupRequest()
+
+				// Extract messages from HistorySync
+				var messages []map[string]interface{}
+				if historySync.Data != nil && historySync.Data.Conversations != nil {
+					log.Debug().
+						Str("userID", txtid).
+						Str("chatJID", chatJIDStr).
+						Int("conversation_count", len(historySync.Data.Conversations)).
+						Msg("Processing HistorySync conversations")
+					
+					for _, conv := range historySync.Data.Conversations {
+						if conv != nil && conv.ID != nil {
+							convJID, err := types.ParseJID(*conv.ID)
+							if err != nil {
+								log.Debug().
+									Str("userID", txtid).
+									Str("convID", *conv.ID).
+									Err(err).
+									Msg("Failed to parse conversation JID")
+								continue
+							}
+							
+							log.Debug().
+								Str("userID", txtid).
+								Str("requestedChatJID", chatJID.String()).
+								Str("conversationJID", convJID.String()).
+								Msg("Comparing conversation JIDs")
+							
+							if convJID.String() == chatJID.String() {
+								log.Info().
+									Str("userID", txtid).
+									Str("chatJID", chatJIDStr).
+									Int("message_count", len(conv.Messages)).
+									Msg("Found matching conversation")
+								
+								if conv.Messages != nil {
+									for _, msg := range conv.Messages {
+										if msg != nil && msg.Message != nil {
+											msgMap := s.parseHistoryMessage(msg, chatJID)
+											if msgMap != nil {
+												messages = append(messages, msgMap)
+											}
+										}
+									}
+								}
+								break
+							}
+						}
+					}
+					
+					if len(messages) == 0 {
+						log.Warn().
+							Str("userID", txtid).
+							Str("chatJID", chatJIDStr).
+							Msg("No messages found in HistorySync for requested chat")
+					}
+				} else {
+					log.Warn().
+						Str("userID", txtid).
+						Str("chatJID", chatJIDStr).
+						Msg("HistorySync event has no data or conversations")
+				}
+
+				// Sort messages by timestamp (oldest first)
+				// Messages in HistorySync are typically in reverse chronological order
+				// We'll reverse them to get chronological order
+				for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
+					messages[i], messages[j] = messages[j], messages[i]
+				}
+
+				response := map[string]interface{}{
+					"chat_jid": chatJIDStr,
+					"messages": messages,
+					"count":    len(messages),
+				}
+
+				responseJson, err := json.Marshal(response)
+				if err != nil {
+					s.Respond(w, r, http.StatusInternalServerError, fmt.Errorf("failed to marshal response: %w", err))
+					return
+				}
+
+				s.Respond(w, r, http.StatusOK, string(responseJson))
+				return
+			case <-ctx.Done():
+				ticker.Stop()
+				removeHandler()
+				cleanupRequest()
+				log.Warn().
+					Str("userID", txtid).
+					Str("chatJID", chatJIDStr).
+					Msg("Timeout waiting for history sync response")
+				s.Respond(w, r, http.StatusRequestTimeout, errors.New("timeout waiting for history sync response"))
+				return
+			}
+		case <-ctx.Done():
+			ticker.Stop()
+			removeHandler()
+			cleanupRequest()
+			log.Warn().
+				Str("userID", txtid).
+				Str("chatJID", chatJIDStr).
+				Msg("Timeout waiting for history sync response")
+			s.Respond(w, r, http.StatusRequestTimeout, errors.New("timeout waiting for history sync response"))
+		}
+	}
+}
+
+// parseHistoryMessage converts a history sync message to a map
+func (s *server) parseHistoryMessage(msg *waHistorySync.HistorySyncMsg, chatJID types.JID) map[string]interface{} {
+	if msg == nil || msg.Message == nil {
+		return nil
+	}
+
+	result := map[string]interface{}{
+		"message_id": msg.Message.GetKey().GetId(),
+		"chat_jid":   chatJID.String(),
+		"timestamp":  msg.Message.GetMessageTimestamp(),
+	}
+
+	// Parse sender
+	if msg.Message.GetKey().GetParticipant() != "" {
+		result["sender_jid"] = msg.Message.GetKey().GetParticipant()
+		result["is_from_me"] = false
+	} else {
+		result["sender_jid"] = "me"
+		result["is_from_me"] = true
+	}
+
+	// Parse message content
+	message := msg.Message.GetMessage()
+	if message == nil {
+		return result
+	}
+
+	// Extract text content
+	if message.GetConversation() != "" {
+		result["message_type"] = "text"
+		result["text_content"] = message.GetConversation()
+	} else if message.GetExtendedTextMessage() != nil {
+		result["message_type"] = "text"
+		result["text_content"] = message.GetExtendedTextMessage().GetText()
+	} else if message.GetImageMessage() != nil {
+		result["message_type"] = "image"
+		if caption := message.GetImageMessage().GetCaption(); caption != "" {
+			result["text_content"] = caption
+		}
+	} else if message.GetVideoMessage() != nil {
+		result["message_type"] = "video"
+		if caption := message.GetVideoMessage().GetCaption(); caption != "" {
+			result["text_content"] = caption
+		}
+	} else if message.GetAudioMessage() != nil {
+		result["message_type"] = "audio"
+	} else if message.GetDocumentMessage() != nil {
+		result["message_type"] = "document"
+		if caption := message.GetDocumentMessage().GetCaption(); caption != "" {
+			result["text_content"] = caption
+		}
+	} else if message.GetStickerMessage() != nil {
+		result["message_type"] = "sticker"
+	} else if message.GetLocationMessage() != nil {
+		result["message_type"] = "location"
+	} else if message.GetContactMessage() != nil {
+		result["message_type"] = "contact"
+	} else if message.GetButtonsResponseMessage() != nil {
+		result["message_type"] = "buttons_response"
+		result["text_content"] = message.GetButtonsResponseMessage().GetSelectedButtonID()
+	} else if message.GetListResponseMessage() != nil {
+		result["message_type"] = "list_response"
+		result["text_content"] = message.GetListResponseMessage().GetSingleSelectReply().GetSelectedRowID()
+	} else {
+		result["message_type"] = "unknown"
+	}
+
+	// Extract quoted message if present
+	if message.GetExtendedTextMessage() != nil && message.GetExtendedTextMessage().GetContextInfo() != nil {
+		contextInfo := message.GetExtendedTextMessage().GetContextInfo()
+		if contextInfo.GetQuotedMessage() != nil {
+			result["quoted_message_id"] = contextInfo.GetStanzaId()
+		}
+	}
+
+	return result
 }
 
 // SyncWhatsAppHistory requests message history sync from WhatsApp servers

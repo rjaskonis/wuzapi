@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
 	"github.com/gorilla/mux"
@@ -58,6 +59,11 @@ var (
 	userinfocache    = cache.New(5*time.Minute, 10*time.Minute)
 	lastMessageCache = cache.New(24*time.Hour, 24*time.Hour)
 	globalHTTPClient = newSafeHTTPClient()
+	
+	// Global map for pending history sync requests
+	// Key: "userID:chatJID", Value: channel to send HistorySync events to
+	historySyncRequests     = make(map[string]chan *events.HistorySync)
+	historySyncRequestsMux sync.RWMutex
 )
 
 var privateIPBlocks []*net.IPNet

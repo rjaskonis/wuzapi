@@ -681,6 +681,106 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			log.Error().Err(err).Msg(sqlStmt)
 			return
 		}
+		
+		// Check if automatic history sync is enabled and trigger it
+		var daysToSyncHistory int
+		err = mycli.db.Get(&daysToSyncHistory, "SELECT COALESCE(days_to_sync_history, 0) FROM users WHERE id=$1", mycli.userID)
+		if err != nil {
+			log.Warn().Err(err).Str("userID", mycli.userID).Msg("Failed to get days_to_sync_history from database")
+		} else if daysToSyncHistory > 0 {
+			// Trigger history sync in a goroutine to avoid blocking
+			go func() {
+				log.Info().
+					Str("userID", mycli.userID).
+					Int("days", daysToSyncHistory).
+					Msg("Triggering automatic history sync after connection")
+				
+				// Use the SyncWhatsAppHistory logic but for a single user
+				// Calculate message count based on days (estimate: 15 messages per day)
+				count := daysToSyncHistory * 15
+				if count > 500 {
+					count = 500 // WhatsApp limit
+				}
+				if count < 50 {
+					count = 50 // Minimum reasonable count
+				}
+				
+				// Get all chats for this user and sync each one
+				var query string
+				if mycli.db.DriverName() == "postgres" {
+					query = `
+						SELECT DISTINCT chat_jid
+						FROM message_history
+						WHERE user_id = $1
+						ORDER BY chat_jid`
+				} else {
+					query = `
+						SELECT DISTINCT chat_jid
+						FROM message_history
+						WHERE user_id = ?
+						ORDER BY chat_jid`
+				}
+				
+				var chatJIDs []string
+				err = mycli.db.Select(&chatJIDs, query, mycli.userID)
+				if err != nil {
+					log.Warn().Err(err).Str("userID", mycli.userID).Msg("Failed to get chat list from database, will try to get from WhatsApp")
+				}
+				
+				// If no chats in database, try to get contacts from WhatsApp
+				if len(chatJIDs) == 0 {
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					
+					contacts, err := mycli.WAClient.Store.Contacts.GetAllContacts(ctx)
+					if err == nil {
+						for jid := range contacts {
+							chatJIDs = append(chatJIDs, jid.String())
+						}
+					}
+					
+					// Also get groups
+					groups, err := mycli.WAClient.GetJoinedGroups(ctx)
+					if err == nil {
+						for _, group := range groups {
+							chatJIDs = append(chatJIDs, group.JID.String())
+						}
+					}
+				}
+				
+				if len(chatJIDs) == 0 {
+					log.Info().Str("userID", mycli.userID).Msg("No chats found to sync history for")
+					return
+				}
+				
+				// Sync each chat with a small delay between requests
+				for _, chatJIDStr := range chatJIDs {
+					chatJID, err := types.ParseJID(chatJIDStr)
+					if err != nil {
+						log.Warn().Err(err).Str("chatJID", chatJIDStr).Msg("Failed to parse chat JID, skipping")
+						continue
+					}
+					
+					// Use the syncHistoryForChat function from handlers.go
+					// We need to call it through the server instance
+					err = mycli.s.syncHistoryForChat(context.Background(), mycli.userID, chatJID, count)
+					if err != nil {
+						log.Warn().Err(err).Str("chatJID", chatJIDStr).Msg("Failed to sync history for chat")
+					} else {
+						log.Info().Str("chatJID", chatJIDStr).Int("count", count).Msg("History sync request sent for chat")
+					}
+					
+					// Small delay between requests to avoid overwhelming WhatsApp
+					time.Sleep(100 * time.Millisecond)
+				}
+				
+				log.Info().
+					Str("userID", mycli.userID).
+					Int("days", daysToSyncHistory).
+					Int("chatsSynced", len(chatJIDs)).
+					Msg("Automatic history sync completed")
+			}()
+		}
 	case *events.PairSuccess:
 		log.Info().Str("userid", mycli.userID).Str("token", mycli.token).Str("ID", evt.ID.String()).Str("BusinessName", evt.BusinessName).Str("Platform", evt.Platform).Msg("QR Pair Success")
 		jid := evt.ID
@@ -1548,6 +1648,183 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	case *events.HistorySync:
 		postmap["type"] = "HistorySync"
 		dowebhook = 1
+		
+		// Save HistorySync messages to message_history table
+		if evt.Data != nil && evt.Data.Conversations != nil {
+			go func() {
+				savedCount := 0
+				for _, conv := range evt.Data.Conversations {
+					if conv == nil || conv.ID == nil || conv.Messages == nil {
+						continue
+					}
+					
+					chatJID, err := types.ParseJID(*conv.ID)
+					if err != nil {
+						log.Warn().Err(err).Str("convID", *conv.ID).Msg("Failed to parse conversation JID in HistorySync")
+						continue
+					}
+					
+					for _, msg := range conv.Messages {
+						if msg == nil || msg.Message == nil {
+							continue
+						}
+						
+						// Extract message data
+						messageKey := msg.Message.GetKey()
+						if messageKey == nil {
+							continue
+						}
+						
+						messageID := messageKey.GetId()
+						if messageID == "" {
+							continue
+						}
+						
+						// Determine sender
+						senderJID := "me"
+						if messageKey.GetParticipant() != "" {
+							senderJID = messageKey.GetParticipant()
+						}
+						
+						// Get message content
+						message := msg.Message.GetMessage()
+						if message == nil {
+							continue
+						}
+						
+						// Extract message type and content
+						messageType := "unknown"
+						textContent := ""
+						mediaLink := ""
+						quotedMessageID := ""
+						
+						if message.GetConversation() != "" {
+							messageType = "text"
+							textContent = message.GetConversation()
+						} else if ext := message.GetExtendedTextMessage(); ext != nil {
+							messageType = "text"
+							textContent = ext.GetText()
+							if contextInfo := ext.GetContextInfo(); contextInfo != nil {
+								quotedMessageID = contextInfo.GetStanzaId()
+							}
+						} else if img := message.GetImageMessage(); img != nil {
+							messageType = "image"
+							textContent = img.GetCaption()
+						} else if vid := message.GetVideoMessage(); vid != nil {
+							messageType = "video"
+							textContent = vid.GetCaption()
+						} else if audio := message.GetAudioMessage(); audio != nil {
+							messageType = "audio"
+						} else if doc := message.GetDocumentMessage(); doc != nil {
+							messageType = "document"
+							textContent = doc.GetCaption()
+						} else if sticker := message.GetStickerMessage(); sticker != nil {
+							messageType = "sticker"
+						} else if location := message.GetLocationMessage(); location != nil {
+							messageType = "location"
+							textContent = location.GetName()
+						} else if contact := message.GetContactMessage(); contact != nil {
+							messageType = "contact"
+							textContent = contact.GetDisplayName()
+						} else if buttons := message.GetButtonsResponseMessage(); buttons != nil {
+							messageType = "buttons_response"
+							textContent = buttons.GetSelectedButtonID()
+						} else if list := message.GetListResponseMessage(); list != nil {
+							messageType = "list_response"
+							textContent = list.GetSingleSelectReply().GetSelectedRowID()
+						}
+						
+						// Set default text for media messages without captions
+						if textContent == "" && messageType != "text" && messageType != "reaction" && messageType != "delete" {
+							switch messageType {
+							case "image":
+								textContent = ":image:"
+							case "video":
+								textContent = ":video:"
+							case "audio":
+								textContent = ":audio:"
+							case "document":
+								textContent = ":document:"
+							case "sticker":
+								textContent = ":sticker:"
+							case "contact":
+								textContent = ":contact:"
+							case "location":
+								textContent = ":location:"
+							}
+						}
+						
+						// Get message timestamp
+						msgTimestamp := time.Now()
+						if timestamp := msg.Message.GetMessageTimestamp(); timestamp > 0 {
+							msgTimestamp = time.Unix(int64(timestamp), 0)
+						}
+						
+						// Serialize message to JSON for datajson field
+						evtJSON, err := json.Marshal(msg)
+						if err != nil {
+							log.Error().Err(err).Msg("Failed to marshal HistorySync message to JSON")
+							evtJSON = []byte("{}")
+						}
+						
+						// Save message to history
+						// Only save if there's meaningful content
+						if textContent != "" || mediaLink != "" || (messageType != "text" && messageType != "reaction") {
+							err = mycli.s.saveMessageToHistoryWithTimestamp(
+								mycli.userID,
+								chatJID.String(),
+								senderJID,
+								messageID,
+								messageType,
+								textContent,
+								mediaLink,
+								quotedMessageID,
+								string(evtJSON),
+								msgTimestamp,
+							)
+							if err != nil {
+								log.Error().Err(err).
+									Str("userID", mycli.userID).
+									Str("chatJID", chatJID.String()).
+									Str("messageID", messageID).
+									Msg("Failed to save HistorySync message to history")
+							} else {
+								savedCount++
+							}
+						}
+					}
+				}
+				
+				if savedCount > 0 {
+					log.Info().
+						Str("userID", mycli.userID).
+						Int("savedCount", savedCount).
+						Msg("Saved HistorySync messages to message_history")
+				}
+			}()
+		}
+		
+		// Forward HistorySync events to any pending history sync requests
+		// Check all pending requests for this user
+		historySyncRequestsMux.RLock()
+		for key, ch := range historySyncRequests {
+			// Key format: "userID:chatJID"
+			if strings.HasPrefix(key, mycli.userID+":") {
+				select {
+				case ch <- evt:
+					log.Debug().
+						Str("userID", mycli.userID).
+						Str("requestKey", key).
+						Msg("Forwarded HistorySync event to pending request")
+				default:
+					log.Warn().
+						Str("userID", mycli.userID).
+						Str("requestKey", key).
+						Msg("Failed to forward HistorySync event (channel full)")
+				}
+			}
+		}
+		historySyncRequestsMux.RUnlock()
 	case *events.AppState:
 		log.Info().Str("index", fmt.Sprintf("%+v", evt.Index)).Str("actionValue", fmt.Sprintf("%+v", evt.SyncActionValue)).Msg("App state event received")
 	case *events.LoggedOut:
