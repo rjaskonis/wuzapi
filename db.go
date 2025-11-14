@@ -164,6 +164,7 @@ type HistoryMessage struct {
 	UserID          string    `json:"user_id" db:"user_id"`
 	ChatJID         string    `json:"chat_jid" db:"chat_jid"`
 	SenderJID       string    `json:"sender_jid" db:"sender_jid"`
+	SenderName      string    `json:"sender_name,omitempty" db:"sender_name"`
 	MessageID       string    `json:"message_id" db:"message_id"`
 	Timestamp       time.Time `json:"timestamp" db:"timestamp"`
 	MessageType     string    `json:"message_type" db:"message_type"`
@@ -173,19 +174,19 @@ type HistoryMessage struct {
 	DataJson        string    `json:"data_json" db:"datajson"`
 }
 
-func (s *server) saveMessageToHistory(userID, chatJID, senderJID, messageID, messageType, textContent, mediaLink, quotedMessageID, dataJson string) error {
-	return s.saveMessageToHistoryWithTimestamp(userID, chatJID, senderJID, messageID, messageType, textContent, mediaLink, quotedMessageID, dataJson, time.Now())
+func (s *server) saveMessageToHistory(userID, chatJID, senderJID, messageID, messageType, textContent, mediaLink, quotedMessageID, dataJson, senderName string) error {
+	return s.saveMessageToHistoryWithTimestamp(userID, chatJID, senderJID, messageID, messageType, textContent, mediaLink, quotedMessageID, dataJson, senderName, time.Now())
 }
 
-func (s *server) saveMessageToHistoryWithTimestamp(userID, chatJID, senderJID, messageID, messageType, textContent, mediaLink, quotedMessageID, dataJson string, msgTimestamp time.Time) error {
-	query := `INSERT INTO message_history (user_id, chat_jid, sender_jid, message_id, timestamp, message_type, text_content, media_link, quoted_message_id, datajson)
-              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+func (s *server) saveMessageToHistoryWithTimestamp(userID, chatJID, senderJID, messageID, messageType, textContent, mediaLink, quotedMessageID, dataJson, senderName string, msgTimestamp time.Time) error {
+	query := `INSERT INTO message_history (user_id, chat_jid, sender_jid, sender_name, message_id, timestamp, message_type, text_content, media_link, quoted_message_id, datajson)
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
               ON CONFLICT (user_id, message_id) DO NOTHING`
 	if s.db.DriverName() == "sqlite" {
-		query = `INSERT OR IGNORE INTO message_history (user_id, chat_jid, sender_jid, message_id, timestamp, message_type, text_content, media_link, quoted_message_id, datajson)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		query = `INSERT OR IGNORE INTO message_history (user_id, chat_jid, sender_jid, sender_name, message_id, timestamp, message_type, text_content, media_link, quoted_message_id, datajson)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	}
-	_, err := s.db.Exec(query, userID, chatJID, senderJID, messageID, msgTimestamp, messageType, textContent, mediaLink, quotedMessageID, dataJson)
+	_, err := s.db.Exec(query, userID, chatJID, senderJID, senderName, messageID, msgTimestamp, messageType, textContent, mediaLink, quotedMessageID, dataJson)
 	if err != nil {
 		return fmt.Errorf("failed to save message to history: %w", err)
 	}

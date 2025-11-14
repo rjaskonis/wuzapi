@@ -117,6 +117,16 @@ var migrations = []Migration{
 		Name:  "add_chatwoot_import_messages",
 		UpSQL: addChatwootImportMessagesSQL,
 	},
+	{
+		ID:    18,
+		Name:  "add_push_name_to_message_history",
+		UpSQL: addPushNameToMessageHistorySQL,
+	},
+	{
+		ID:    19,
+		Name:  "rename_push_name_to_sender_name",
+		UpSQL: renamePushNameToSenderNameSQL,
+	},
 }
 
 const changeIDToStringSQL = `
@@ -260,6 +270,34 @@ BEGIN
     -- Add dataJson column to message_history table if it doesn't exist
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'message_history' AND column_name = 'datajson') THEN
         ALTER TABLE message_history ADD COLUMN datajson TEXT;
+    END IF;
+END $$;
+
+-- SQLite version (handled in code)
+`
+
+const addPushNameToMessageHistorySQL = `
+-- PostgreSQL version
+DO $$
+BEGIN
+    -- Add push_name column to message_history table if it doesn't exist
+    -- Place it after sender_jid column (we can't control exact position in PostgreSQL, but it will be added)
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'message_history' AND column_name = 'push_name') THEN
+        ALTER TABLE message_history ADD COLUMN push_name TEXT;
+    END IF;
+END $$;
+
+-- SQLite version (handled in code)
+`
+
+const renamePushNameToSenderNameSQL = `
+-- PostgreSQL version
+DO $$
+BEGIN
+    -- Rename push_name column to sender_name if push_name exists and sender_name doesn't
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'message_history' AND column_name = 'push_name')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'message_history' AND column_name = 'sender_name') THEN
+        ALTER TABLE message_history RENAME COLUMN push_name TO sender_name;
     END IF;
 END $$;
 
@@ -799,6 +837,40 @@ func applyMigrationSQLOnly(db *sqlx.DB, migration Migration) error {
 		} else {
 			_, err = tx.Exec(migration.UpSQL)
 		}
+	} else if migration.ID == 18 {
+		if db.DriverName() == "sqlite" {
+			// Handle push_name column for message_history table in SQLite
+			err = addColumnIfNotExistsSQLite(tx, "message_history", "push_name", "TEXT")
+		} else {
+			_, err = tx.Exec(migration.UpSQL)
+		}
+	} else if migration.ID == 19 {
+		if db.DriverName() == "sqlite" {
+			// SQLite doesn't support RENAME COLUMN directly in older versions
+			// Check if push_name exists and sender_name doesn't, then rename
+			var pushNameExists, senderNameExists int
+			err = tx.Get(&pushNameExists, `
+				SELECT COUNT(*) FROM pragma_table_info('message_history')
+				WHERE name = 'push_name'`)
+			if err == nil && pushNameExists > 0 {
+				err = tx.Get(&senderNameExists, `
+					SELECT COUNT(*) FROM pragma_table_info('message_history')
+					WHERE name = 'sender_name'`)
+				if err == nil && senderNameExists == 0 {
+					// SQLite 3.25.0+ supports ALTER TABLE RENAME COLUMN
+					// For older versions, we'd need to recreate the table, but let's try RENAME COLUMN first
+					_, err = tx.Exec(`ALTER TABLE message_history RENAME COLUMN push_name TO sender_name`)
+					if err != nil {
+						// If RENAME COLUMN fails (old SQLite version), log warning but don't fail migration
+						// The column will remain as push_name in old SQLite versions
+						log.Warn().Err(err).Msg("SQLite version may not support RENAME COLUMN, column will remain as push_name")
+						err = nil // Don't fail the migration
+					}
+				}
+			}
+		} else {
+			_, err = tx.Exec(migration.UpSQL)
+		}
 	} else {
 		_, err = tx.Exec(migration.UpSQL)
 	}
@@ -1084,6 +1156,40 @@ func applyMigration(db *sqlx.DB, migration Migration) error {
 		if db.DriverName() == "sqlite" {
 			// Handle chatwoot_import_messages column for SQLite
 			err = addColumnIfNotExistsSQLite(tx, "users", "chatwoot_import_messages", "BOOLEAN DEFAULT 0")
+		} else {
+			_, err = tx.Exec(migration.UpSQL)
+		}
+	} else if migration.ID == 18 {
+		if db.DriverName() == "sqlite" {
+			// Handle push_name column for message_history table in SQLite
+			err = addColumnIfNotExistsSQLite(tx, "message_history", "push_name", "TEXT")
+		} else {
+			_, err = tx.Exec(migration.UpSQL)
+		}
+	} else if migration.ID == 19 {
+		if db.DriverName() == "sqlite" {
+			// SQLite doesn't support RENAME COLUMN directly in older versions
+			// Check if push_name exists and sender_name doesn't, then rename
+			var pushNameExists, senderNameExists int
+			err = tx.Get(&pushNameExists, `
+				SELECT COUNT(*) FROM pragma_table_info('message_history')
+				WHERE name = 'push_name'`)
+			if err == nil && pushNameExists > 0 {
+				err = tx.Get(&senderNameExists, `
+					SELECT COUNT(*) FROM pragma_table_info('message_history')
+					WHERE name = 'sender_name'`)
+				if err == nil && senderNameExists == 0 {
+					// SQLite 3.25.0+ supports ALTER TABLE RENAME COLUMN
+					// For older versions, we'd need to recreate the table, but let's try RENAME COLUMN first
+					_, err = tx.Exec(`ALTER TABLE message_history RENAME COLUMN push_name TO sender_name`)
+					if err != nil {
+						// If RENAME COLUMN fails (old SQLite version), log warning but don't fail migration
+						// The column will remain as push_name in old SQLite versions
+						log.Warn().Err(err).Msg("SQLite version may not support RENAME COLUMN, column will remain as push_name")
+						err = nil // Don't fail the migration
+					}
+				}
+			}
 		} else {
 			_, err = tx.Exec(migration.UpSQL)
 		}

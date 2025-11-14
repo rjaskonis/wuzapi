@@ -6735,7 +6735,13 @@ func (s *server) syncHistoryForChat(ctx context.Context, userID string, chatJID 
 // save outgoing message to history
 func (s *server) saveOutgoingMessageToHistory(userID, chatJID, messageID, messageType, textContent, mediaLink string, historyLimit int) {
 	if historyLimit > 0 {
-		err := s.saveMessageToHistory(userID, chatJID, "me", messageID, messageType, textContent, mediaLink, "", "")
+		// Get pushName from client store for outgoing messages
+		var pushName string
+		if client := clientManager.GetWhatsmeowClient(userID); client != nil && client.Store != nil {
+			pushName = client.Store.PushName
+		}
+		
+		err := s.saveMessageToHistory(userID, chatJID, "me", messageID, messageType, textContent, mediaLink, "", "", pushName)
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to save outgoing message to history")
 		} else {

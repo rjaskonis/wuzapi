@@ -55,8 +55,28 @@ type MyClient struct {
 // historyLogMutex protects concurrent writes to history.log
 var historyLogMutex sync.Mutex
 
-// getPushNameWithCache retrieves pushName for a JID using in-memory cache to avoid repeated lookups
-// Returns empty string if pushName cannot be determined
+// getBestContactName returns the best available name from ContactInfo
+// Priority: PushName > BusinessName > FullName > FirstName
+func getBestContactName(contact types.ContactInfo) string {
+	if contact.PushName != "" {
+		return contact.PushName
+	}
+	if contact.BusinessName != "" {
+		return contact.BusinessName
+	}
+	if contact.FullName != "" {
+		return contact.FullName
+	}
+	if contact.FirstName != "" {
+		return contact.FirstName
+	}
+	return ""
+}
+
+// getPushNameWithCache retrieves the best available contact name for a JID using in-memory cache
+// Returns empty string if no name can be determined
+// Uses GetAllContacts (same as GetContacts endpoint) as fallback to ensure we get contact names
+// Priority: PushName > BusinessName > FullName > FirstName
 func (mycli *MyClient) getPushNameWithCache(ctx context.Context, jid types.JID, isFromMe bool, accountOwnerJID string) string {
 	if jid.User == "" {
 		return ""
@@ -81,22 +101,42 @@ func (mycli *MyClient) getPushNameWithCache(ctx context.Context, jid types.JID, 
 			if mycli.WAClient.Store.PushName != "" {
 				pushName = mycli.WAClient.Store.PushName
 			} else {
-				// Fallback: try to get from contact store
-				if contact, err := mycli.WAClient.Store.Contacts.GetContact(ctx, jid); err == nil {
-					pushName = contact.PushName
+				// Fallback: try to get from contact store using GetAllContacts (same as GetContacts endpoint)
+				if allContacts, err := mycli.WAClient.Store.Contacts.GetAllContacts(ctx); err == nil {
+					if contact, found := allContacts[jid]; found {
+						pushName = getBestContactName(contact)
+					}
 				}
 			}
 		} else {
-			// For incoming messages, get PushName from contact store
-			if contact, err := mycli.WAClient.Store.Contacts.GetContact(ctx, jid); err == nil {
-				pushName = contact.PushName
+			// For incoming messages, use GetAllContacts (same as GetContacts endpoint) to get the best available name
+			// This ensures we get the same data as the GetContacts API endpoint
+			if allContacts, err := mycli.WAClient.Store.Contacts.GetAllContacts(ctx); err == nil {
+				if contact, found := allContacts[jid]; found {
+					pushName = getBestContactName(contact)
+				}
+				// Also populate cache with all contacts we just loaded (using best available name)
+				mycli.pushNameMutex.Lock()
+				for cJID, contact := range allContacts {
+					if bestName := getBestContactName(contact); bestName != "" {
+						mycli.pushNameCache[cJID.String()] = bestName
+					}
+				}
+				mycli.pushNameMutex.Unlock()
+			} else {
+				// Fallback to GetContact if GetAllContacts fails
+				if contact, err := mycli.WAClient.Store.Contacts.GetContact(ctx, jid); err == nil {
+					pushName = getBestContactName(contact)
+				}
 			}
 		}
 	}
 	
-	// Store in cache (write lock)
+	// Store in cache (write lock) - only cache non-empty values to avoid caching empty strings
 	mycli.pushNameMutex.Lock()
-	mycli.pushNameCache[jidStr] = pushName
+	if pushName != "" {
+		mycli.pushNameCache[jidStr] = pushName
+	}
 	mycli.pushNameMutex.Unlock()
 	
 	return pushName
@@ -1490,6 +1530,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					mediaLink,
 					replyToMessageID,
 					string(evtJSON),
+					evt.Info.PushName,
 				)
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to save message to history")
@@ -1916,6 +1957,37 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 					accountOwnerJID = mycli.WAClient.Store.ID.ToNonAD().String()
 				}
 				
+				// Pre-load all contacts using GetAllContacts (same method as GetContacts endpoint)
+				// This ensures contact names are available in the cache before processing messages
+				// Uses best available name: PushName > BusinessName > FullName > FirstName
+				ctx := context.Background()
+				if mycli.WAClient != nil && mycli.WAClient.Store != nil {
+					allContacts, err := mycli.WAClient.Store.Contacts.GetAllContacts(ctx)
+					if err == nil {
+						// Populate cache with all contacts' best available names
+						mycli.pushNameMutex.Lock()
+						for jid, contact := range allContacts {
+							if bestName := getBestContactName(contact); bestName != "" {
+								mycli.pushNameCache[jid.String()] = bestName
+							}
+						}
+						// Also cache the account owner's pushName
+						if mycli.WAClient.Store.PushName != "" && accountOwnerJID != "" {
+							accountJID, err := types.ParseJID(accountOwnerJID)
+							if err == nil {
+								mycli.pushNameCache[accountJID.String()] = mycli.WAClient.Store.PushName
+							}
+						}
+						mycli.pushNameMutex.Unlock()
+						log.Debug().
+							Str("userID", mycli.userID).
+							Int("contactsLoaded", len(allContacts)).
+							Msg("Pre-loaded contacts for HistorySync contact name retrieval")
+					} else {
+						log.Warn().Err(err).Str("userID", mycli.userID).Msg("Failed to load all contacts for HistorySync")
+					}
+				}
+				
 				savedCount := 0
 				skippedCount := 0
 				for _, conv := range evt.Data.Conversations {
@@ -2082,8 +2154,16 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 						}
 						
 						// Get PushName using cache to avoid repeated lookups
-						ctx := context.Background()
+						// Reuse the context created earlier for contact loading
 						pushName := mycli.getPushNameWithCache(ctx, senderJIDForInfo, isFromMe, accountOwnerJID)
+						if pushName == "" && senderJIDForInfo.User != "" {
+							// Log when pushName is empty but we have a valid JID - helps debug
+							log.Debug().
+								Str("userID", mycli.userID).
+								Str("senderJID", senderJIDForInfo.String()).
+								Bool("isFromMe", isFromMe).
+								Msg("PushName is empty for sender in HistorySync")
+						}
 						
 						// Create MessageInfo structure matching events.Message format
 						messageInfo := types.MessageInfo{
@@ -2140,6 +2220,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 								mediaLink,
 								quotedMessageID,
 								string(evtJSON),
+								pushName,
 								msgTimestamp,
 							)
 							if err != nil {
